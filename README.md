@@ -1,8 +1,8 @@
-# 🦜️🔗 LangChain {partner}
+# 🦜️🔗 LangChain pgvec-textsearch (WIP)
 
 This repository contains 1 package with {partner} integrations with LangChain:
 
-- [langchain-{package_lower}](https://pypi.org/project/langchain-{package_lower}/)
+- [langchain-pgvec-textsearch](https://pypi.org/project/langchain-pgvec-textsearch/)
 
 ## Initial Repo Checklist (Remove this section after completing)
 
