@@ -218,7 +218,7 @@ async def setup_korean_table(engine: PGVecTextSearchEngine) -> None:
         ],
         bm25_index=BM25Index(
             name=f"idx_{TABLE_NAME_KOREAN}_bm25",
-            text_config="public.korean",  # Korean text search configuration
+            text_config="public.korean",  # Korean text search configuration (textsearch_ko)
             k1=1.2,
             b=0.75,
         ),
