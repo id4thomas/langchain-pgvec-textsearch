@@ -7,7 +7,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from .reference.engine import PGEngine, Column, ColumnDict
+from langchain_postgres import PGEngine, Column, ColumnDict
+
 from .indexes import BM25Index, HNSWIndex, DistanceStrategy
 
 
