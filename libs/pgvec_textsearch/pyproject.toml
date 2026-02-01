@@ -1,6 +1,6 @@
 [project]
 name = "langchain-pgvec-textsearch"
-version = "0.1.1"
+version = "0.1.4"
 description = "LangChain VectorStore for hybrid search with pgvector (dense) and pg_textsearch (BM25)"
 readme = "README.md"
 license = { text = "MIT" }
