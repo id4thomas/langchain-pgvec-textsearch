@@ -7,6 +7,7 @@ from .vectorstores import (
     weighted_sum_ranking,
     DistanceStrategy,
     QueryOptions,
+    IterativeScanMode,
     HNSWIndex,
     IVFFlatIndex,
     BM25Index,
@@ -14,9 +15,6 @@ from .vectorstores import (
     FilterCondition,
     MetadataFilter,
     MetadataFilters,
-    PGEngine,
-    Column,
-    ColumnDict,
 )
 
 __all__ = [
@@ -27,6 +25,7 @@ __all__ = [
     "weighted_sum_ranking",
     "DistanceStrategy",
     "QueryOptions",
+    "IterativeScanMode",
     "HNSWIndex",
     "IVFFlatIndex",
     "BM25Index",
@@ -34,7 +33,4 @@ __all__ = [
     "FilterCondition",
     "MetadataFilter",
     "MetadataFilters",
-    "PGEngine",
-    "Column",
-    "ColumnDict",
 ]

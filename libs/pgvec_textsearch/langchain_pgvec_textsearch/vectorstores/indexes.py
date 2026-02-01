@@ -52,12 +52,29 @@ DEFAULT_DISTANCE_STRATEGY = DistanceStrategy.COSINE_DISTANCE
 DEFAULT_INDEX_NAME_SUFFIX = "_langchain_index"
 
 
+class IterativeScanMode(Enum):
+    """Iterative scan mode for HNSW index (pgvector 0.8.0+)."""
+
+    OFF = "off"
+    RELAXED_ORDER = "relaxed_order"  # Better performance, may reorder some results
+    STRICT_ORDER = "strict_order"  # Maintains strict distance ordering
+
+
 @dataclass
 class QueryOptions:
-    """Query options for index configuration."""
+    """Query options for index configuration.
+
+    Args:
+        ef_search: Size of dynamic candidate list for HNSW search.
+            Higher values improve recall at cost of speed. Default: 40.
+        probes: Number of lists to probe for IVFFlat index. Default: 1.
+        iterative_scan: Iterative scan mode for HNSW (pgvector 0.8.0+).
+            Useful when filtering reduces results below requested k.
+    """
 
     ef_search: Optional[int] = None
     probes: Optional[int] = None
+    iterative_scan: Optional[IterativeScanMode] = None
 
     def to_parameter(self) -> list[str]:
         """Convert to SET LOCAL parameters."""
@@ -66,6 +83,8 @@ class QueryOptions:
             params.append(f"hnsw.ef_search = {self.ef_search}")
         if self.probes is not None:
             params.append(f"ivfflat.probes = {self.probes}")
+        if self.iterative_scan is not None:
+            params.append(f"hnsw.iterative_scan = {self.iterative_scan.value}")
         return params
 
 

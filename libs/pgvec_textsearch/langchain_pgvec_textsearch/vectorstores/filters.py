@@ -175,19 +175,21 @@ def build_filter_clause(
     """
     Build SQL WHERE clause from MetadataFilter/MetadataFilters.
 
+    All metadata is stored in and filtered from the JSON column (langchain_metadata).
+
     Args:
         filters: MetadataFilters or MetadataFilter object.
-        metadata_columns: List of dedicated metadata columns.
-        json_column: JSON column name for non-dedicated metadata.
+        metadata_columns: Deprecated, kept for backward compatibility. Not used.
+        json_column: JSON column name containing all metadata (default: langchain_metadata).
 
     Returns:
         Tuple of (SQL clause string, parameter dict).
 
     Example:
         >>> filter_obj = MetadataFilter(key="category", value="tech", operator=FilterOperator.EQ)
-        >>> clause, params = build_filter_clause(filter_obj, metadata_columns=["category"])
+        >>> clause, params = build_filter_clause(filter_obj, json_column="langchain_metadata")
         >>> print(clause)
-        "category" = :p_1
+        "langchain_metadata"->>'category' = :p_1
         >>> print(params)
         {'p_1': 'tech'}
     """
@@ -249,11 +251,16 @@ def _build_single_filter(
     counter[0] += 1
     param_name = f"{prefix}_{counter[0]}"
 
-    # Determine field selector
-    if f.key in metadata_columns:
-        field_selector = f'"{f.key}"'
-    elif json_column:
-        field_selector = f'"{json_column}"->>\'{f.key}\''
+    # All metadata is stored in JSON column (langchain_metadata)
+    # metadata_columns parameter is kept for backward compatibility but not used
+    if json_column:
+        # JSON ->> returns text, so we need type casting for numeric comparisons
+        json_path = f'"{json_column}"->>\'{f.key}\''
+        # Determine if we need numeric casting based on value type
+        if isinstance(f.value, (int, float)) and f.value is not None:
+            field_selector = f"({json_path})::numeric"
+        else:
+            field_selector = json_path
     else:
         field_selector = f'"{f.key}"'
 

@@ -9,6 +9,7 @@ from .hybrid_search_config import (
 from .indexes import (
     DistanceStrategy,
     QueryOptions,
+    IterativeScanMode,
     BaseIndex,
     HNSWIndex,
     IVFFlatIndex,
@@ -23,9 +24,6 @@ from .filters import (
     build_filter_clause,
 )
 
-# Re-export from reference for convenience
-from .reference.engine import PGEngine, Column, ColumnDict
-
 __all__ = [
     # Main classes
     "PGVecTextSearchStore",
@@ -37,6 +35,7 @@ __all__ = [
     # Indexes
     "DistanceStrategy",
     "QueryOptions",
+    "IterativeScanMode",
     "BaseIndex",
     "HNSWIndex",
     "IVFFlatIndex",
@@ -48,8 +47,4 @@ __all__ = [
     "MetadataFilter",
     "MetadataFilters",
     "build_filter_clause",
-    # Engine helpers
-    "PGEngine",
-    "Column",
-    "ColumnDict",
 ]

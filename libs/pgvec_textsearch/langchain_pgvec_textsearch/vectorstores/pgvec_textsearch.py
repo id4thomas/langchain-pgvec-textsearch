@@ -66,15 +66,15 @@ class PGVecTextSearchStore(VectorStore):
         schema_name: str = "public",
         content_column: str = "content",
         embedding_column: str = "embedding",
-        metadata_columns: Optional[list[str]] = None,
         id_column: str = "langchain_id",
-        metadata_json_column: Optional[str] = "langchain_metadata",
+        metadata_column: Optional[str] = "langchain_metadata",
         distance_strategy: DistanceStrategy = DEFAULT_DISTANCE_STRATEGY,
         k: int = 4,
         fetch_k: int = 20,
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        **kwargs,  # Accept but ignore deprecated parameters
     ):
         """
         PGVecTextSearchStore constructor.
@@ -87,9 +87,8 @@ class PGVecTextSearchStore(VectorStore):
             schema_name: Database schema name. Default: "public".
             content_column: Column for document content. Default: "content".
             embedding_column: Column for embeddings. Default: "embedding".
-            metadata_columns: List of metadata column names.
             id_column: Column for document IDs. Default: "langchain_id".
-            metadata_json_column: Column for JSON metadata. Default: "langchain_metadata".
+            metadata_column: Column for JSON metadata. Default: "langchain_metadata".
             distance_strategy: Vector distance strategy. Default: COSINE_DISTANCE.
             k: Number of results to return. Default: 4.
             fetch_k: Number of results to fetch for MMR. Default: 20.
@@ -108,9 +107,8 @@ class PGVecTextSearchStore(VectorStore):
         self.schema_name = schema_name
         self.content_column = content_column
         self.embedding_column = embedding_column
-        self.metadata_columns = metadata_columns if metadata_columns is not None else []
         self.id_column = id_column
-        self.metadata_json_column = metadata_json_column
+        self.metadata_column = metadata_column
         self.distance_strategy = distance_strategy
         self.k = k
         self.fetch_k = fetch_k
@@ -128,19 +126,20 @@ class PGVecTextSearchStore(VectorStore):
         schema_name: str = "public",
         content_column: str = "content",
         embedding_column: str = "embedding",
-        metadata_columns: Optional[list[str]] = None,
-        ignore_metadata_columns: Optional[list[str]] = None,
         id_column: str = "langchain_id",
-        metadata_json_column: Optional[str] = "langchain_metadata",
+        metadata_column: Optional[str] = "langchain_metadata",
         distance_strategy: DistanceStrategy = DEFAULT_DISTANCE_STRATEGY,
         k: int = 4,
         fetch_k: int = 20,
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        **kwargs,  # Accept but ignore deprecated parameters
     ) -> PGVecTextSearchStore:
         """
         Create a PGVecTextSearchStore instance asynchronously.
+
+        All document metadata is stored in the langchain_metadata JSON column.
 
         Args:
             engine: PGVecTextSearchEngine for database connections.
@@ -149,10 +148,8 @@ class PGVecTextSearchStore(VectorStore):
             schema_name: Database schema name. Default: "public".
             content_column: Column for document content. Default: "content".
             embedding_column: Column for embeddings. Default: "embedding".
-            metadata_columns: List of metadata column names.
-            ignore_metadata_columns: Columns to ignore for metadata.
             id_column: Column for document IDs. Default: "langchain_id".
-            metadata_json_column: Column for JSON metadata.
+            metadata_column: Column for JSON metadata.
             distance_strategy: Vector distance strategy.
             k: Number of results to return.
             fetch_k: Number of results for MMR.
@@ -163,14 +160,6 @@ class PGVecTextSearchStore(VectorStore):
         Returns:
             PGVecTextSearchStore instance.
         """
-        if metadata_columns is None:
-            metadata_columns = []
-
-        if metadata_columns and ignore_metadata_columns:
-            raise ValueError(
-                "Cannot use both metadata_columns and ignore_metadata_columns."
-            )
-
         # Get column info from database
         stmt = """
             SELECT column_name, data_type
@@ -205,24 +194,9 @@ class PGVecTextSearchStore(VectorStore):
                 f"Embedding column '{embedding_column}' must be a vector type."
             )
 
-        metadata_json_column = (
-            None if metadata_json_column not in columns else metadata_json_column
+        metadata_column = (
+            None if metadata_column not in columns else metadata_column
         )
-
-        # Validate metadata columns
-        for column in metadata_columns:
-            if column not in columns:
-                raise ValueError(f"Metadata column '{column}' does not exist.")
-
-        # Handle ignore_metadata_columns
-        if ignore_metadata_columns:
-            all_columns = dict(columns)
-            for column in ignore_metadata_columns:
-                all_columns.pop(column, None)
-            all_columns.pop(id_column, None)
-            all_columns.pop(content_column, None)
-            all_columns.pop(embedding_column, None)
-            metadata_columns = list(all_columns.keys())
 
         return cls(
             cls.__create_key,
@@ -232,9 +206,8 @@ class PGVecTextSearchStore(VectorStore):
             schema_name=schema_name,
             content_column=content_column,
             embedding_column=embedding_column,
-            metadata_columns=metadata_columns,
             id_column=id_column,
-            metadata_json_column=metadata_json_column,
+            metadata_column=metadata_column,
             distance_strategy=distance_strategy,
             k=k,
             fetch_k=fetch_k,
@@ -273,7 +246,10 @@ class PGVecTextSearchStore(VectorStore):
         ids: Optional[list] = None,
         **kwargs: Any,
     ) -> list[str]:
-        """Add data along with embeddings to the table."""
+        """Add data along with embeddings to the table.
+
+        All metadata from Document is stored in the langchain_metadata JSON column.
+        """
         texts_list = list(texts)
         if not ids:
             ids = [str(uuid.uuid4()) for _ in texts_list]
@@ -283,62 +259,25 @@ class PGVecTextSearchStore(VectorStore):
             metadatas = [{} for _ in texts_list]
 
         for id_, content, embedding, metadata in zip(ids, texts_list, embeddings, metadatas):
-            metadata_col_names = (
-                ", " + ", ".join(f'"{col}"' for col in self.metadata_columns)
-                if self.metadata_columns
-                else ""
-            )
-
+            # Build INSERT statement - only core columns + langchain_metadata
             insert_stmt = f'''
                 INSERT INTO "{self.schema_name}"."{self.table_name}"
-                ("{self.id_column}", "{self.content_column}", "{self.embedding_column}"{metadata_col_names}'''
+                ("{self.id_column}", "{self.content_column}", "{self.embedding_column}", "{self.metadata_column}")'''
 
             values = {
                 "langchain_id": id_,
                 "content": content,
                 "embedding": str([float(dim) for dim in embedding]),
+                "metadata": json.dumps(metadata),  # ALL metadata goes to JSON column
             }
-            values_stmt = "VALUES (:langchain_id, :content, :embedding"
-
-            # Add metadata columns
-            extra = copy.deepcopy(metadata)
-            for metadata_column in self.metadata_columns:
-                if metadata_column in metadata:
-                    values_stmt += f", :{metadata_column}"
-                    values[metadata_column] = (
-                        json.dumps(metadata[metadata_column])
-                        if isinstance(metadata[metadata_column], dict)
-                        else metadata[metadata_column]
-                    )
-                    del extra[metadata_column]
-                else:
-                    values_stmt += ", null"
-
-            # Add JSON column
-            insert_stmt += (
-                f', "{self.metadata_json_column}")'
-                if self.metadata_json_column
-                else ")"
-            )
-            if self.metadata_json_column:
-                values_stmt += ", :extra)"
-                values["extra"] = json.dumps(extra)
-            else:
-                values_stmt += ")"
+            values_stmt = "VALUES (:langchain_id, :content, :embedding, :metadata)"
 
             # Upsert statement
             upsert_stmt = f'''
                 ON CONFLICT ("{self.id_column}") DO UPDATE SET
                 "{self.content_column}" = EXCLUDED."{self.content_column}",
-                "{self.embedding_column}" = EXCLUDED."{self.embedding_column}"'''
-
-            if self.metadata_json_column:
-                upsert_stmt += f', "{self.metadata_json_column}" = EXCLUDED."{self.metadata_json_column}"'
-
-            for column in self.metadata_columns:
-                upsert_stmt += f', "{column}" = EXCLUDED."{column}"'
-
-            upsert_stmt += ";"
+                "{self.embedding_column}" = EXCLUDED."{self.embedding_column}",
+                "{self.metadata_column}" = EXCLUDED."{self.metadata_column}";'''
 
             query = insert_stmt + values_stmt + upsert_stmt
             async with self.engine.connect() as conn:
@@ -420,10 +359,8 @@ class PGVecTextSearchStore(VectorStore):
             self.id_column,
             self.content_column,
             self.embedding_column,
-        ] + self.metadata_columns
-        if self.metadata_json_column:
-            columns.append(self.metadata_json_column)
-
+            self.metadata_column,
+        ]
         column_names = ", ".join(f'"{col}"' for col in columns)
 
         safe_filter, filter_dict = ("", {})
@@ -447,11 +384,36 @@ class PGVecTextSearchStore(VectorStore):
             param_dict.update(filter_dict)
 
         async with self.engine.connect() as conn:
+            # Apply index query options
             if self.index_query_options:
                 for query_option in self.index_query_options.to_parameter():
                     await conn.execute(text(f"SET LOCAL {query_option};"))
+
+            # Apply HybridSearchConfig HNSW parameters (override index_query_options)
+            if self.hybrid_search_config.ef_search is not None:
+                await conn.execute(
+                    text(f"SET LOCAL hnsw.ef_search = {self.hybrid_search_config.ef_search};")
+                )
+            if self.hybrid_search_config.iterative_scan is not None:
+                await conn.execute(
+                    text(f"SET LOCAL hnsw.iterative_scan = '{self.hybrid_search_config.iterative_scan.value}';")
+                )
+
             result = await conn.execute(text(query_stmt), param_dict)
             return result.mappings().fetchall()
+
+    @staticmethod
+    def _sanitize_index_name(name: str) -> str:
+        """Sanitize index name by replacing special characters with underscores
+        and lowercasing.
+
+        PostgreSQL index names with special characters (like hyphens) or uppercase
+        letters can cause issues with pg_textsearch's internal index lookup mechanism.
+        pg_textsearch's internal lookups are case-sensitive and may not match
+        PostgreSQL's identifier handling.
+        """
+        sanitized = name.replace("-", "_").replace(" ", "_").lower()
+        return sanitized
 
     async def _aquery_sparse(
         self,
@@ -463,9 +425,8 @@ class PGVecTextSearchStore(VectorStore):
         columns = [
             self.id_column,
             self.content_column,
-        ] + self.metadata_columns
-        if self.metadata_json_column:
-            columns.append(self.metadata_json_column)
+            self.metadata_column,
+        ]
 
         column_names = ", ".join(f'"{col}"' for col in columns)
 
@@ -478,7 +439,13 @@ class PGVecTextSearchStore(VectorStore):
         # pg_textsearch uses <@> operator for BM25 scoring
         # Returns negative BM25 score (lower is better)
         # Must use to_bm25query with explicit index name for prepared statements
-        bm25_index_name = self.hybrid_search_config.bm25_index_name or f"idx_{self.table_name}_bm25"
+        # Sanitize the default index name to match how it's created in engine.py
+        if self.hybrid_search_config.bm25_index_name:
+            bm25_index_name = self.hybrid_search_config.bm25_index_name
+        else:
+            sanitized_table_name = self._sanitize_index_name(self.table_name)
+            bm25_index_name = f"idx_{sanitized_table_name}_bm25"
+
         query_stmt = f'''
             SELECT {column_names},
                    "{self.content_column}" <@> to_bm25query(:query_text, '{bm25_index_name}') as bm25_score
@@ -528,6 +495,8 @@ class PGVecTextSearchStore(VectorStore):
         # Fuse results
         fusion_params = {
             **config.fusion_function_parameters,
+            "dense_weight": config.dense_weight,
+            "sparse_weight": config.sparse_weight,
             "fetch_top_k": k,
             "distance_strategy": self.distance_strategy,
             "id_column": self.id_column,
@@ -592,16 +561,17 @@ class PGVecTextSearchStore(VectorStore):
 
         documents_with_scores = []
         for row in results:
+            # All metadata is stored in langchain_metadata JSON column
             metadata = (
-                row.get(self.metadata_json_column, {})
-                if self.metadata_json_column
+                row.get(self.metadata_column, {})
+                if self.metadata_column
                 else {}
             )
             if metadata is None:
                 metadata = {}
-            for col in self.metadata_columns:
-                if col in row:
-                    metadata[col] = row[col]
+            # Handle case where JSON column returns a string instead of dict
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
 
             # Get score (RRF score, distance, or BM25 score)
             score = row.get("rrf_score") or row.get("distance") or row.get("bm25_score", 0.0)
@@ -673,16 +643,17 @@ class PGVecTextSearchStore(VectorStore):
         documents = []
         for i, row in enumerate(results):
             if i in mmr_selected:
+                # All metadata is stored in langchain_metadata JSON column
                 metadata = (
-                    row.get(self.metadata_json_column, {})
-                    if self.metadata_json_column
+                    row.get(self.metadata_column, {})
+                    if self.metadata_column
                     else {}
                 )
                 if metadata is None:
                     metadata = {}
-                for col in self.metadata_columns:
-                    if col in row:
-                        metadata[col] = row[col]
+                # Handle case where JSON column returns a string instead of dict
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
                 documents.append(
                     Document(
                         page_content=row[self.content_column],
@@ -695,9 +666,7 @@ class PGVecTextSearchStore(VectorStore):
 
     async def aget_by_ids(self, ids: Sequence[str]) -> list[Document]:
         """Get documents by IDs."""
-        columns = [self.id_column, self.content_column] + self.metadata_columns
-        if self.metadata_json_column:
-            columns.append(self.metadata_json_column)
+        columns = [self.id_column, self.content_column, self.metadata_column]
 
         column_names = ", ".join(f'"{col}"' for col in columns)
         placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
@@ -715,16 +684,17 @@ class PGVecTextSearchStore(VectorStore):
 
         documents = []
         for row in results:
+            # All metadata is stored in langchain_metadata JSON column
             metadata = (
-                row.get(self.metadata_json_column, {})
-                if self.metadata_json_column
+                row.get(self.metadata_column, {})
+                if self.metadata_column
                 else {}
             )
             if metadata is None:
                 metadata = {}
-            for col in self.metadata_columns:
-                if col in row:
-                    metadata[col] = row[col]
+            # Handle case where JSON column returns a string instead of dict
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
             documents.append(
                 Document(
                     page_content=row[self.content_column],
@@ -789,7 +759,11 @@ class PGVecTextSearchStore(VectorStore):
     ) -> None:
         """Create a BM25 index on the content column for pg_textsearch."""
         if name is None:
-            name = index.name or f"{self.table_name}_bm25_idx"
+            if index.name:
+                name = index.name
+            else:
+                sanitized_table_name = self._sanitize_index_name(self.table_name)
+                name = f"idx_{sanitized_table_name}_bm25"
 
         stmt = f'''
             CREATE INDEX {"CONCURRENTLY" if concurrently else ""} "{name}"
@@ -818,7 +792,9 @@ class PGVecTextSearchStore(VectorStore):
 
     async def adrop_bm25_index(self, index_name: Optional[str] = None) -> None:
         """Drop the BM25 index."""
-        index_name = index_name or f"{self.table_name}_bm25_idx"
+        if index_name is None:
+            sanitized_table_name = self._sanitize_index_name(self.table_name)
+            index_name = f"idx_{sanitized_table_name}_bm25"
         query = f'DROP INDEX IF EXISTS "{self.schema_name}"."{index_name}";'
         async with self.engine.connect() as conn:
             await conn.execute(text(query))
@@ -868,8 +844,7 @@ class PGVecTextSearchStore(VectorStore):
         """
         return build_filter_clause(
             filters=filters,
-            metadata_columns=self.metadata_columns,
-            json_column=self.metadata_json_column,
+            json_column=self.metadata_column,
         )
 
     # ==========================================

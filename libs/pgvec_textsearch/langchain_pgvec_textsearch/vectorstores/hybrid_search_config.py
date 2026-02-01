@@ -6,13 +6,15 @@ from typing import Any, Callable, Optional, Sequence
 
 from sqlalchemy import RowMapping
 
-from .indexes import DistanceStrategy
+from .indexes import DistanceStrategy, IterativeScanMode
 
 
 def reciprocal_rank_fusion(
     dense_results: Sequence[RowMapping],
     sparse_results: Sequence[RowMapping],
     rrf_k: float = 60,
+    dense_weight: float = 1.0,
+    sparse_weight: float = 1.0,
     fetch_top_k: int = 4,
     **kwargs: Any,
 ) -> Sequence[dict[str, Any]]:
@@ -27,6 +29,8 @@ def reciprocal_rank_fusion(
         dense_results: Results from pgvector dense search.
         sparse_results: Results from pg_textsearch BM25 sparse search.
         rrf_k: The RRF parameter k. Default: 60.
+        dense_weight: Weight for dense search RRF scores. Default: 1.0.
+        sparse_weight: Weight for sparse search RRF scores. Default: 1.0.
         fetch_top_k: Number of documents to return. Default: 4.
 
     Returns:
@@ -52,7 +56,7 @@ def reciprocal_rank_fusion(
         if doc_id not in rrf_scores:
             rrf_scores[doc_id] = dict(row)
             rrf_scores[doc_id]["rrf_score"] = 0.0
-        rrf_scores[doc_id]["rrf_score"] += 1.0 / (rank + 1 + rrf_k)
+        rrf_scores[doc_id]["rrf_score"] += dense_weight * (1.0 / (rank + 1 + rrf_k))
 
     # Sparse search (BM25): <@> returns negative BM25 score, lower is better
     # So we sort ascending (reverse=False)
@@ -67,7 +71,7 @@ def reciprocal_rank_fusion(
         if doc_id not in rrf_scores:
             rrf_scores[doc_id] = dict(row)
             rrf_scores[doc_id]["rrf_score"] = 0.0
-        rrf_scores[doc_id]["rrf_score"] += 1.0 / (rank + 1 + rrf_k)
+        rrf_scores[doc_id]["rrf_score"] += sparse_weight * (1.0 / (rank + 1 + rrf_k))
 
     # Sort by RRF score descending
     ranked_results = sorted(
@@ -168,7 +172,7 @@ class HybridSearchConfig:
     text_config: str = "public.korean"
 
     # BM25 index name (required for pg_textsearch with prepared statements)
-    # If None, will use "idx_{table_name}_bm25"
+    # If None, will use "idx_{sanitized_table_name}_bm25" where hyphens/spaces are replaced with underscores
     bm25_index_name: Optional[str] = None
 
     # Fusion function to combine dense and sparse results
@@ -183,6 +187,11 @@ class HybridSearchConfig:
     dense_top_k: int = 20
     sparse_top_k: int = 20
 
+    # Weights for hybrid search fusion (used by RRF and weighted_sum_ranking)
+    # Higher weight = more influence on final ranking
+    dense_weight: float = 1.0
+    sparse_weight: float = 1.0
+
     # Enable/disable each search type
     enable_dense: bool = True
     enable_sparse: bool = True
@@ -190,6 +199,12 @@ class HybridSearchConfig:
     # BM25 index parameters (used when creating index)
     bm25_k1: float = 1.2
     bm25_b: float = 0.75
+
+    # HNSW query parameters (pgvector)
+    # ef_search: Size of dynamic candidate list. Higher = better recall, slower. Default: 40
+    ef_search: Optional[int] = None
+    # iterative_scan: Expand search when filtering reduces results (pgvector 0.8.0+)
+    iterative_scan: Optional[IterativeScanMode] = None
 
     def __post_init__(self):
         if not self.enable_dense and not self.enable_sparse:
