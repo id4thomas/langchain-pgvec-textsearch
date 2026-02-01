@@ -1,0 +1,5 @@
+datasets==4.5.0
+langchain-openai==1.1.7
+langchain-pgvec-textsearch==0.1.1
+matplotlib==3.10.8
+pydantic-settings==2.12.0
