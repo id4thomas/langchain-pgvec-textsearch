@@ -74,6 +74,7 @@ class PGVecTextSearchStore(VectorStore):
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        insert_batch_size: int = 500,
         **kwargs,  # Accept but ignore deprecated parameters
     ):
         """
@@ -95,6 +96,7 @@ class PGVecTextSearchStore(VectorStore):
             lambda_mult: MMR diversity parameter. Default: 0.5.
             index_query_options: Query options for index.
             hybrid_search_config: Configuration for hybrid search.
+            insert_batch_size: Batch size for bulk insert operations. Default: 500.
         """
         if key != PGVecTextSearchStore.__create_key:
             raise Exception(
@@ -115,6 +117,7 @@ class PGVecTextSearchStore(VectorStore):
         self.lambda_mult = lambda_mult
         self.index_query_options = index_query_options
         self.hybrid_search_config = hybrid_search_config or HybridSearchConfig()
+        self.insert_batch_size = insert_batch_size
 
     @classmethod
     async def create(
@@ -134,6 +137,7 @@ class PGVecTextSearchStore(VectorStore):
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        insert_batch_size: int = 500,
         **kwargs,  # Accept but ignore deprecated parameters
     ) -> PGVecTextSearchStore:
         """
@@ -156,6 +160,7 @@ class PGVecTextSearchStore(VectorStore):
             lambda_mult: MMR diversity parameter.
             index_query_options: Query options for index.
             hybrid_search_config: Configuration for hybrid search.
+            insert_batch_size: Batch size for bulk insert operations. Default: 500.
 
         Returns:
             PGVecTextSearchStore instance.
@@ -214,6 +219,7 @@ class PGVecTextSearchStore(VectorStore):
             lambda_mult=lambda_mult,
             index_query_options=index_query_options,
             hybrid_search_config=hybrid_search_config,
+            insert_batch_size=insert_batch_size,
         )
 
     @classmethod
@@ -246,9 +252,10 @@ class PGVecTextSearchStore(VectorStore):
         ids: Optional[list] = None,
         **kwargs: Any,
     ) -> list[str]:
-        """Add data along with embeddings to the table.
+        """Add data along with embeddings to the table (bulk insert).
 
         All metadata from Document is stored in the langchain_metadata JSON column.
+        Uses bulk insert with batching for better performance.
         """
         texts_list = list(texts)
         if not ids:
@@ -258,31 +265,51 @@ class PGVecTextSearchStore(VectorStore):
         if not metadatas:
             metadatas = [{} for _ in texts_list]
 
-        for id_, content, embedding, metadata in zip(ids, texts_list, embeddings, metadatas):
-            # Build INSERT statement - only core columns + langchain_metadata
-            insert_stmt = f'''
-                INSERT INTO "{self.schema_name}"."{self.table_name}"
-                ("{self.id_column}", "{self.content_column}", "{self.embedding_column}", "{self.metadata_column}")'''
+        # Batch size to avoid too many parameters (PostgreSQL limit ~65535)
+        # Each row has 4 parameters, so insert_batch_size * 4 < 65535
+        insert_batch_size = self.insert_batch_size
 
-            values = {
-                "langchain_id": id_,
-                "content": content,
-                "embedding": str([float(dim) for dim in embedding]),
-                "metadata": json.dumps(metadata),  # ALL metadata goes to JSON column
-            }
-            values_stmt = "VALUES (:langchain_id, :content, :embedding, :metadata)"
+        async with self.engine.connect() as conn:
+            for batch_start in range(0, len(texts_list), insert_batch_size):
+                batch_end = min(batch_start + insert_batch_size, len(texts_list))
 
-            # Upsert statement
-            upsert_stmt = f'''
-                ON CONFLICT ("{self.id_column}") DO UPDATE SET
-                "{self.content_column}" = EXCLUDED."{self.content_column}",
-                "{self.embedding_column}" = EXCLUDED."{self.embedding_column}",
-                "{self.metadata_column}" = EXCLUDED."{self.metadata_column}";'''
+                batch_ids = ids[batch_start:batch_end]
+                batch_texts = texts_list[batch_start:batch_end]
+                batch_embeddings = embeddings[batch_start:batch_end]
+                batch_metadatas = metadatas[batch_start:batch_end]
 
-            query = insert_stmt + values_stmt + upsert_stmt
-            async with self.engine.connect() as conn:
-                await conn.execute(text(query), values)
-                await conn.commit()
+                # Build multi-row VALUES clause
+                values_clauses = []
+                params = {}
+
+                for i, (id_, content, embedding, metadata) in enumerate(
+                    zip(batch_ids, batch_texts, batch_embeddings, batch_metadatas)
+                ):
+                    values_clauses.append(
+                        f"(:id_{i}, :content_{i}, :embedding_{i}, :metadata_{i})"
+                    )
+                    params[f"id_{i}"] = id_
+                    params[f"content_{i}"] = content
+                    params[f"embedding_{i}"] = str([float(dim) for dim in embedding])
+                    params[f"metadata_{i}"] = json.dumps(metadata)
+
+                values_stmt = ", ".join(values_clauses)
+
+                # Build bulk INSERT statement with ON CONFLICT
+                query = f'''
+                    INSERT INTO "{self.schema_name}"."{self.table_name}"
+                    ("{self.id_column}", "{self.content_column}", "{self.embedding_column}", "{self.metadata_column}")
+                    VALUES {values_stmt}
+                    ON CONFLICT ("{self.id_column}") DO UPDATE SET
+                    "{self.content_column}" = EXCLUDED."{self.content_column}",
+                    "{self.embedding_column}" = EXCLUDED."{self.embedding_column}",
+                    "{self.metadata_column}" = EXCLUDED."{self.metadata_column}";
+                '''
+
+                await conn.execute(text(query), params)
+
+            # Commit once after all batches
+            await conn.commit()
 
         return ids
 
