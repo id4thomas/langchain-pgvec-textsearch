@@ -74,14 +74,14 @@ async def main():
         engine=engine,
         embedding_service=embedding_service,
         table_name=TABLE_NAME,
-        hybrid_search_config=HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=20,
-            sparse_top_k=20,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-        ),
+        # hybrid_search_config=HybridSearchConfig(
+        #     enable_dense=True,
+        #     enable_sparse=True,
+        #     dense_top_k=20,
+        #     sparse_top_k=20,
+        #     fusion_function=reciprocal_rank_fusion,
+        #     fusion_function_parameters={"rrf_k": 60},
+        # ),
     )
 
     # Prepare Documents (Korean)
@@ -100,13 +100,31 @@ async def main():
     ]
     print(f"Loaded {len(docs)} documents")
 
-    # Index Documents
+    # Index Documents with concurrency
     batch_size = 64
+    concurrency = 16
+    semaphore = asyncio.Semaphore(concurrency)
+    indexed_count = 0
+    lock = asyncio.Lock()
+
+    async def index_batch(batch_idx: int, batch: list[Document]):
+        nonlocal indexed_count
+        async with semaphore:
+            await store.aadd_documents(batch)
+            async with lock:
+                indexed_count += len(batch)
+                if batch_idx % 10 == 0:
+                    print(f"Indexed {indexed_count}/{len(docs)} documents")
+
+    # Create all tasks
+    tasks = []
     for i in range(0, len(docs), batch_size):
         batch = docs[i:i+batch_size]
-        await store.aadd_documents(batch)
-        if (i // batch_size) % 10 == 0:
-            print(f"Indexed {min(i+batch_size, len(docs))}/{len(docs)} documents")
+        tasks.append(index_batch(i // batch_size, batch))
+
+    # Run with concurrency
+    print(f"Indexing with concurrency={concurrency}...")
+    await asyncio.gather(*tasks)
 
     print(f"\nIndexing complete: {len(docs)} Korean documents indexed")
     print(f"Table: {TABLE_NAME}")

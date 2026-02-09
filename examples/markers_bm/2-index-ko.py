@@ -49,6 +49,7 @@ async def main():
         metadata_columns=[
             Column("corpus_id", "TEXT"),
             Column("corpus_title", "TEXT"),
+            Column("domain", "TEXT"),
         ],
         hnsw_index=HNSWIndex(
             m=32,
@@ -74,14 +75,14 @@ async def main():
         engine=engine,
         embedding_service=embedding_service,
         table_name=TABLE_NAME,
-        hybrid_search_config=HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=20,
-            sparse_top_k=20,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-        ),
+        # hybrid_search_config=HybridSearchConfig(
+        #     enable_dense=True,
+        #     enable_sparse=True,
+        #     dense_top_k=20,
+        #     sparse_top_k=20,
+        #     fusion_function=reciprocal_rank_fusion,
+        #     fusion_function_parameters={"rrf_k": 60},
+        # ),
     )
 
     # Prepare Documents (Korean)
@@ -94,6 +95,7 @@ async def main():
             metadata={
                 "corpus_id": x["_id"],
                 "corpus_title": x["title"],
+                "domain": x["_id"].split(" - ")[0]
             },
         )
         for x in corpus_ds[CORPUS_SPLIT]

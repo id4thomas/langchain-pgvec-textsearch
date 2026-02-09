@@ -1,5 +1,5 @@
 """
-Indexing Script for Ko-StrategyQA Dataset (English)
+Indexing Script for MLDR Dataset (English)
 
 Creates:
 - Table with English corpus
@@ -7,7 +7,8 @@ Creates:
 - BM25 index with english text search config
 """
 import asyncio
-from datasets import load_dataset
+import json
+from pathlib import Path
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pgvec_textsearch import (
@@ -23,10 +24,13 @@ from langchain_postgres import Column
 
 from config import settings
 
-DATA_NAME = "KoStrategyQA"
-TABLE_NAME = f"{DATA_NAME}-documents-en"  # English table
-CORPUS_LANG = "en"
+DATA_NAME = "MLDR"
+LANG = "en"
+TABLE_NAME = f"{DATA_NAME}-{LANG}-documents"
 TEXT_CONFIG = "english"
+
+# Set to None for full corpus, or a number to limit for testing
+MAX_DOCS = None  # e.g., 10000 for quick testing
 
 DATABASE_URL = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
     settings.postgres_user,
@@ -48,8 +52,7 @@ async def main():
         table_name=TABLE_NAME,
         vector_size=settings.embedding_dim,
         metadata_columns=[
-            Column("corpus_id", "TEXT"),
-            Column("corpus_title", "TEXT"),
+            Column("docid", "TEXT"),
         ],
         hnsw_index=HNSWIndex(
             m=32,
@@ -85,20 +88,28 @@ async def main():
         ),
     )
 
-    # Prepare Documents (English)
-    corpus_ds = load_dataset(settings.data_dir, "corpus")
+    # Load corpus from local JSONL file
+    corpus_path = Path(settings.data_dir) / f"mldr-v1.0-{LANG}" / "corpus.jsonl"
+    print(f"Loading MLDR corpus for language '{LANG}' from {corpus_path}...")
 
-    print(f"Loading {CORPUS_LANG} corpus...")
-    docs = [
-        Document(
-            page_content=f"{x['title']}\n{x['text']}"[:settings.max_length],
-            metadata={
-                "corpus_id": x["_id"],
-                "corpus_title": x["title"],
-            },
-        )
-        for x in corpus_ds[CORPUS_LANG]
-    ]
+    docs = []
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if MAX_DOCS and len(docs) >= MAX_DOCS:
+                break
+            x = json.loads(line)
+            docs.append(
+                Document(
+                    page_content=x["text"][:settings.max_length],
+                    metadata={
+                        "docid": x["docid"],
+                    },
+                )
+            )
+
+    if MAX_DOCS and len(docs) >= MAX_DOCS:
+        print(f"Reached MAX_DOCS={MAX_DOCS} limit")
+
     print(f"Loaded {len(docs)} documents")
 
     # Index Documents with concurrency
@@ -114,7 +125,7 @@ async def main():
             await store.aadd_documents(batch)
             async with lock:
                 indexed_count += len(batch)
-                if batch_idx % 10 == 0:
+                if batch_idx % 100 == 0:
                     print(f"Indexed {indexed_count}/{len(docs)} documents")
 
     # Create all tasks

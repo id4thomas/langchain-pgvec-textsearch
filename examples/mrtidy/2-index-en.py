@@ -1,13 +1,15 @@
 """
-Indexing Script for Ko-StrategyQA Dataset (English)
+Indexing Script for MrTidy Dataset (English)
 
 Creates:
-- Table with English corpus
+- Table with English corpus (32.9M documents)
 - HNSW index for dense vector search
 - BM25 index with english text search config
+
+Data: /home/yrlab/datasets/retrieval/mrtidy/english-corpus
 """
 import asyncio
-from datasets import load_dataset
+from datasets import load_from_disk
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pgvec_textsearch import (
@@ -23,10 +25,13 @@ from langchain_postgres import Column
 
 from config import settings
 
-DATA_NAME = "KoStrategyQA"
-TABLE_NAME = f"{DATA_NAME}-documents-en"  # English table
-CORPUS_LANG = "en"
-TEXT_CONFIG = "english"
+LANG = "english"
+DATA_NAME = "mrtidy"
+TABLE_NAME = f"{DATA_NAME}-{LANG}"
+TEXT_CONFIG = "english"  # Built-in PostgreSQL text search config
+
+# Set to None for full corpus, or a number to limit for testing
+MAX_DOCS = None  # e.g., 10000 for quick testing
 
 DATABASE_URL = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
     settings.postgres_user,
@@ -85,25 +90,37 @@ async def main():
         ),
     )
 
-    # Prepare Documents (English)
-    corpus_ds = load_dataset(settings.data_dir, "corpus")
+    # Load corpus from disk (Arrow format)
+    corpus_path = f"{settings.data_dir}/{LANG}-corpus"
+    print(f"Loading corpus from {corpus_path}...")
+    corpus_ds = load_from_disk(corpus_path)
+    corpus = corpus_ds["train"]
 
-    print(f"Loading {CORPUS_LANG} corpus...")
-    docs = [
-        Document(
-            page_content=f"{x['title']}\n{x['text']}"[:settings.max_length],
-            metadata={
-                "corpus_id": x["_id"],
-                "corpus_title": x["title"],
-            },
+    total_docs = len(corpus)
+    if MAX_DOCS:
+        total_docs = min(MAX_DOCS, total_docs)
+        print(f"Limiting to {total_docs} documents (MAX_DOCS={MAX_DOCS})")
+
+    print(f"Preparing {total_docs} documents...")
+    docs = []
+    for i, x in enumerate(corpus):
+        if MAX_DOCS and i >= MAX_DOCS:
+            break
+        docs.append(
+            Document(
+                page_content=f"{x['title']}\n{x['text']}"[:settings.max_length],
+                metadata={
+                    "corpus_id": x["_id"],
+                    "corpus_title": x["title"],
+                },
+            )
         )
-        for x in corpus_ds[CORPUS_LANG]
-    ]
+
     print(f"Loaded {len(docs)} documents")
 
     # Index Documents with concurrency
     batch_size = 64
-    concurrency = 16
+    concurrency = 32
     semaphore = asyncio.Semaphore(concurrency)
     indexed_count = 0
     lock = asyncio.Lock()
@@ -114,7 +131,7 @@ async def main():
             await store.aadd_documents(batch)
             async with lock:
                 indexed_count += len(batch)
-                if batch_idx % 10 == 0:
+                if batch_idx % 100 == 0:
                     print(f"Indexed {indexed_count}/{len(docs)} documents")
 
     # Create all tasks
