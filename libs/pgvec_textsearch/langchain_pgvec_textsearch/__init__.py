@@ -1,36 +1,63 @@
 """LangChain pgvec_textsearch integration."""
+
 from .vectorstores import (
+    # Main classes
     PGVecTextSearchStore,
-    PGVecTextSearchEngine,
-    HybridSearchConfig,
-    reciprocal_rank_fusion,
-    weighted_sum_ranking,
+    AsyncPGVecTextSearchEngine,
+    # Table & Data
+    TableConfig,
+    Row,
+    Column,
+    ColumnDict,
+    # Index configs
+    HNSWIndexConfig,
+    IVFFlatIndexConfig,
+    BM25IndexConfig,
+    # Search configs
+    SearchConfig,
+    HNSWSearchConfig,
+    BM25SearchConfig,
+    # Types
     DistanceStrategy,
-    QueryOptions,
-    IterativeScanMode,
-    HNSWIndex,
-    IVFFlatIndex,
-    BM25Index,
+    FusionStrategy,
+    IterativeScanStrategy,
+    # Search utils
+    reciprocal_rank_fusion,
+    # Filters
     FilterOperator,
     FilterCondition,
     MetadataFilter,
     MetadataFilters,
+    build_filter_clause,
 )
 
 __all__ = [
+    # Main classes
     "PGVecTextSearchStore",
-    "PGVecTextSearchEngine",
-    "HybridSearchConfig",
-    "reciprocal_rank_fusion",
-    "weighted_sum_ranking",
+    "AsyncPGVecTextSearchEngine",
+    # Table & Data
+    "TableConfig",
+    "Row",
+    "Column",
+    "ColumnDict",
+    # Index configs
+    "HNSWIndexConfig",
+    "IVFFlatIndexConfig",
+    "BM25IndexConfig",
+    # Search configs
+    "SearchConfig",
+    "HNSWSearchConfig",
+    "BM25SearchConfig",
+    # Types
     "DistanceStrategy",
-    "QueryOptions",
-    "IterativeScanMode",
-    "HNSWIndex",
-    "IVFFlatIndex",
-    "BM25Index",
+    "FusionStrategy",
+    "IterativeScanStrategy",
+    # Search utils
+    "reciprocal_rank_fusion",
+    # Filters
     "FilterOperator",
     "FilterCondition",
     "MetadataFilter",
     "MetadataFilters",
+    "build_filter_clause",
 ]

@@ -1,289 +1,459 @@
-"""Engine for pg_textsearch VectorStore with BM25 support."""
-from __future__ import annotations
+import asyncio
+import json
+from typing import Any, Optional, Sequence
 
-from typing import Any, Optional, Union
-
-from sqlalchemy import text
+from sqlalchemy import RowMapping, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from langchain_postgres import PGEngine, Column, ColumnDict
+from .config import (
+    BM25IndexConfig,
+    HNSWSearchConfig,
+    HNSWIndexConfig,
+    IVFFlatIndexConfig,
+    BM25SearchConfig,
+    TableConfig,
+)
+from .data import Row
+from .types.search import IterativeScanStrategy
 
-from .indexes import BM25Index, HNSWIndex, DistanceStrategy
+def _sanitize_name(name: str) -> str:
+    """Sanitize name by replacing special characters with underscores
+    and lowercasing.
 
+    PostgreSQL index names with special characters (like hyphens) or uppercase
+    letters can cause issues with pg_textsearch's internal index lookup mechanism.
+    pg_textsearch's internal lookups are case-sensitive and may not match
+    PostgreSQL's identifier handling.
+    """
+    sanitized = name.replace("-", "_").replace(" ", "_").lower()
+    return sanitized
 
-class PGVecTextSearchEngine(PGEngine):
-    """Engine that extends PGEngine with pg_textsearch (BM25) support."""
+class AsyncPGVecTextSearchEngine:
+    """A class for managing async connections to a Postgres database.
+    modified from [langchain-postgres](https://github.com/langchain-ai/langchain-postgres) package"""
+
+    __create_key = object()
+
+    def __init__(
+        self,
+        key: object,
+        pool: AsyncEngine,
+    ):
+        """AsyncPGEngine constructor.
+
+        Args:
+            key (object): Prevent direct constructor usage.
+            pool (AsyncEngine): Async engine connection pool.
+        """
+        if key != AsyncPGVecTextSearchEngine.__create_key:
+            raise Exception(
+                "Only create class through 'from_connection_string' or 'from_engine' methods!"
+            )
+        self._pool = pool
 
     @classmethod
-    def from_connection_string_async(
+    def from_engine(
+        cls: type["AsyncPGVecTextSearchEngine"],
+        engine: AsyncEngine
+    ) -> "AsyncPGVecTextSearchEngine":
+        """Create an AsyncPGVecTextSearchEngine instance from an AsyncEngine."""
+        return cls(cls.__create_key, engine)
+
+    @classmethod
+    def from_connection_string(
         cls,
         url: str | URL,
         **kwargs: Any,
-    ) -> "PGVecTextSearchEngine":
-        """
-        Create an engine for use with asyncio.run() or async contexts.
-
-        Unlike from_connection_string(), this does NOT create a background thread.
-        Use this when you're running in an async context (e.g., asyncio.run()).
-
-        Args:
-            url: Database connection URL.
-            **kwargs: Additional arguments for create_async_engine.
-
-        Returns:
-            PGVecTextSearchEngine instance.
-        """
+    ) -> "AsyncPGVecTextSearchEngine":
         engine = create_async_engine(url, **kwargs)
-        # Create without background loop (loop=None, thread=None)
-        return cls(cls._PGEngine__create_key, engine, None, None)
+        return cls(cls.__create_key, engine)
 
-    async def _ainit_hybrid_vectorstore_table(
-        self,
-        table_name: str,
-        vector_size: int,
-        *,
-        schema_name: str = "public",
-        content_column: str = "content",
-        embedding_column: str = "embedding",
-        metadata_column: str = "langchain_metadata",
-        id_column: Union[str, Column, ColumnDict] = "langchain_id",
-        overwrite_existing: bool = False,
-        bm25_index: Optional[BM25Index] = None,
-        hnsw_index: Optional[HNSWIndex] = None,
-        **kwargs,  # Accept but ignore deprecated parameters
-    ) -> None:
-        """
-        Create a table for saving vectors with both HNSW and BM25 indexes.
+    async def close(self) -> None:
+        """Dispose of connection pool"""
+        await self._pool.dispose()
 
-        All document metadata is stored in the langchain_metadata JSON column.
-
-        Args:
-            table_name: The database table name.
-            vector_size: Vector size for the embedding model.
-            schema_name: The schema name. Default: "public".
-            content_column: Name of the column to store document content.
-            embedding_column: Name of the column to store vector embeddings.
-            metadata_column: Column to store metadata in JSON format.
-            id_column: Column to store ids.
-            overwrite_existing: Whether to drop existing table.
-            bm25_index: BM25 index configuration for pg_textsearch.
-            hnsw_index: HNSW index configuration for pgvector.
-        """
-        schema_name = self._escape_postgres_identifier(schema_name)
-        table_name_escaped = self._escape_postgres_identifier(table_name)
-        content_column_escaped = self._escape_postgres_identifier(content_column)
-        embedding_column_escaped = self._escape_postgres_identifier(embedding_column)
-
-        if isinstance(id_column, str):
-            id_column = self._escape_postgres_identifier(id_column)
-        elif isinstance(id_column, Column):
-            id_column.name = self._escape_postgres_identifier(id_column.name)
-        else:
-            self._validate_column_dict(id_column)
-            id_column["name"] = self._escape_postgres_identifier(id_column["name"])
-
-        # Create extensions
+    async def _init_extensions(self):
         async with self._pool.connect() as conn:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_textsearch"))
             await conn.commit()
 
+    # ==========================================
+    # Filter Support
+    # ==========================================
+
+    @staticmethod
+    def build_filter_clause(
+        table_config: TableConfig,
+        filter: dict | None = None,
+    ) -> tuple[str, dict]:
+        """Convert a dict filter to SQL WHERE clause.
+
+        Uses PostgreSQL JSON containment (@>).
+        Example: {"category": "tech"} → metadata @> '{"category":"tech"}'
+        """
+        if not filter:
+            return "", {}
+        meta_col = table_config.escaped_metadata_column
+        clause = f'"{meta_col}"::jsonb @> :filter_json::jsonb'
+        params = {"filter_json": json.dumps(filter)}
+        return clause, params
+
+    # ==========================================
+    # Table Management
+    # ==========================================
+
+    async def init_table(
+        self,
+        table_config: TableConfig,
+        overwrite_existing: bool = False
+    ):
+        table_name = table_config.escaped_table_name
+        schema_name = table_config.escaped_schema_name
+
+        query = """CREATE TABLE IF NOT EXISTS "{}"."{}"(
+            "{}" UUID PRIMARY KEY,
+            "{}" TEXT NOT NULL,
+            "{}" vector({}) NOT NULL,
+            "{}" JSON
+        );""".format(
+            schema_name,
+            table_name,
+            table_config.escaped_id_column,
+            table_config.escaped_content_column,
+            table_config.escaped_embedding_column,
+            table_config.vector_size,
+            table_config.escaped_metadata_column
+        )
+
         if overwrite_existing:
             async with self._pool.connect() as conn:
                 await conn.execute(
-                    text(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name_escaped}"')
+                    text(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}"')
                 )
                 await conn.commit()
-
-        if isinstance(id_column, str):
-            id_data_type = "UUID"
-            id_column_name = id_column
-        elif isinstance(id_column, Column):
-            id_data_type = id_column.data_type
-            id_column_name = id_column.name
-        else:
-            id_data_type = id_column["data_type"]
-            id_column_name = id_column["name"]
-
-        # Create table with core columns only (all metadata in JSON column)
-        query = f"""CREATE TABLE IF NOT EXISTS "{schema_name}"."{table_name_escaped}"(
-            "{id_column_name}" {id_data_type} PRIMARY KEY,
-            "{content_column_escaped}" TEXT NOT NULL,
-            "{embedding_column_escaped}" vector({vector_size}) NOT NULL,
-            "{metadata_column}" JSON
-        );"""
 
         async with self._pool.connect() as conn:
             await conn.execute(text(query))
             await conn.commit()
 
-        # Create indexes
-        await self._acreate_indexes(
-            table_name=table_name,
-            schema_name=schema_name,
-            content_column=content_column,
-            embedding_column=embedding_column,
-            bm25_index=bm25_index,
-            hnsw_index=hnsw_index,
-        )
+    # ==========================================
+    # Index Management
+    # ==========================================
 
-    @staticmethod
-    def _sanitize_index_name(name: str) -> str:
-        """Sanitize index name by replacing special characters with underscores
-        and lowercasing.
-
-        PostgreSQL index names with special characters (like hyphens) or uppercase
-        letters can cause issues with pg_textsearch's internal index lookup mechanism.
-        pg_textsearch's internal lookups are case-sensitive and may not match
-        PostgreSQL's identifier handling.
-        """
-        # Replace hyphens and other problematic characters with underscores
-        # Also lowercase to avoid pg_textsearch case sensitivity issues
-        sanitized = name.replace("-", "_").replace(" ", "_").lower()
-        return sanitized
-
-    async def _acreate_indexes(
+    async def create_hnsw_index(
         self,
-        table_name: str,
-        schema_name: str = "public",
-        content_column: str = "content",
-        embedding_column: str = "embedding",
-        bm25_index: Optional[BM25Index] = None,
-        hnsw_index: Optional[HNSWIndex] = None,
-    ) -> tuple[Optional[str], Optional[str]]:
-        """Create HNSW and BM25 indexes on the table.
+        table_config: TableConfig,
+        hnsw_config: HNSWIndexConfig
+    ):
+        table_name = table_config.escaped_table_name
+        schema_name = table_config.escaped_schema_name
+        sanitized_table_name = _sanitize_name(table_name)
 
-        Returns:
-            Tuple of (hnsw_index_name, bm25_index_name) that were created.
+        index_name = hnsw_config.name or f"idx_{sanitized_table_name}_hnsw"
+        query = f"""
+            CREATE INDEX IF NOT EXISTS "{index_name}"
+            ON "{schema_name}"."{table_name}"
+            USING hnsw ("{table_config.escaped_embedding_column}" {hnsw_config.index_function})
+            WITH {hnsw_config.index_options};
         """
-        table_name_escaped = self._escape_postgres_identifier(table_name)
-        schema_name_escaped = self._escape_postgres_identifier(schema_name)
-        content_column_escaped = self._escape_postgres_identifier(content_column)
-        embedding_column_escaped = self._escape_postgres_identifier(embedding_column)
+        async with self._pool.connect() as conn:
+            await conn.execute(text(query))
+            await conn.commit()
 
-        # Sanitize table name for use in index names to avoid pg_textsearch lookup issues
-        sanitized_table_name = self._sanitize_index_name(table_name)
+    async def create_ivfflat_index(
+        self,
+        table_config: TableConfig,
+        ivfflat_config: IVFFlatIndexConfig
+    ):
+        table_name = table_config.escaped_table_name
+        schema_name = table_config.escaped_schema_name
+        sanitized_table_name = _sanitize_name(table_name)
 
-        hnsw_name_created = None
-        bm25_name_created = None
+        index_name = ivfflat_config.name or f"idx_{sanitized_table_name}_ivfflat"
+        query = f"""
+            CREATE INDEX IF NOT EXISTS "{index_name}"
+            ON "{schema_name}"."{table_name}"
+            USING ivfflat ("{table_config.escaped_embedding_column}" {ivfflat_config.index_function})
+            WITH {ivfflat_config.index_options};
+        """
+        async with self._pool.connect() as conn:
+            await conn.execute(text(query))
+            await conn.commit()
+
+    async def create_bm25_index(
+        self,
+        table_config: TableConfig,
+        bm25_config: BM25IndexConfig
+    ):
+        table_name = table_config.escaped_table_name
+        schema_name = table_config.escaped_schema_name
+        sanitized_table_name = _sanitize_name(table_name)
+
+        index_name = bm25_config.name or f"idx_{sanitized_table_name}_bm25"
+        query = f"""
+            CREATE INDEX IF NOT EXISTS "{index_name}"
+            ON "{schema_name}"."{table_name}"
+            USING bm25 ("{table_config.escaped_content_column}")
+            WITH {bm25_config.index_options};
+        """
+        async with self._pool.connect() as conn:
+            await conn.execute(text(query))
+            await conn.commit()
+
+    # ==========================================
+    # Row Operations
+    # ==========================================
+
+    async def insert_rows(
+        self,
+        table_config: TableConfig,
+        rows: list[Row],
+        batch_size: int = 500,
+    ) -> list[str]:
+        """Bulk insert rows into the table.
+
+        Uses batched inserts with ON CONFLICT upsert.
+        Each Row encapsulates (id, content, embedding, metadata).
+        """
+        if not rows:
+            return []
+
+        tc = table_config
 
         async with self._pool.connect() as conn:
-            # HNSW index for dense vectors
-            if hnsw_index:
-                hnsw_name = hnsw_index.name or f"idx_{sanitized_table_name}_hnsw"
-                hnsw_name_created = hnsw_name
-                hnsw_query = f"""
-                    CREATE INDEX IF NOT EXISTS "{hnsw_name}"
-                    ON "{schema_name_escaped}"."{table_name_escaped}"
-                    USING hnsw ("{embedding_column_escaped}" {hnsw_index.get_index_function()})
-                    WITH {hnsw_index.index_options()};
-                """
-                await conn.execute(text(hnsw_query))
+            for batch_start in range(0, len(rows), batch_size):
+                batch = rows[batch_start:batch_start + batch_size]
 
-            # BM25 index for sparse search (pg_textsearch)
-            if bm25_index:
-                bm25_name = bm25_index.name or f"idx_{sanitized_table_name}_bm25"
-                bm25_name_created = bm25_name
-                bm25_query = f"""
-                    CREATE INDEX IF NOT EXISTS "{bm25_name}"
-                    ON "{schema_name_escaped}"."{table_name_escaped}"
-                    USING bm25 ("{content_column_escaped}")
-                    WITH {bm25_index.index_options()};
-                """
-                await conn.execute(text(bm25_query))
+                values_clauses = []
+                params = {}
+
+                for i, row in enumerate(batch):
+                    values_clauses.append(
+                        f"(:id_{i}, :content_{i}, :embedding_{i}, :metadata_{i})"
+                    )
+                    params[f"id_{i}"] = row.id
+                    params[f"content_{i}"] = row.content
+                    params[f"embedding_{i}"] = row.embedding_as_str()
+                    params[f"metadata_{i}"] = row.metadata_as_json()
+
+                values_stmt = ", ".join(values_clauses)
+
+                id_col = tc.escaped_id_column
+                txt_col = tc.escaped_content_column
+                emb_col = tc.escaped_embedding_column
+                meta_col = tc.escaped_metadata_column
+
+                query = f'''
+                    INSERT INTO "{tc.escaped_schema_name}"."{tc.escaped_table_name}"
+                    ("{id_col}", "{txt_col}", "{emb_col}", "{meta_col}")
+                    VALUES {values_stmt}
+                    ON CONFLICT ("{id_col}") DO UPDATE SET
+                    "{txt_col}" = EXCLUDED."{txt_col}",
+                    "{emb_col}" = EXCLUDED."{emb_col}",
+                    "{meta_col}" = EXCLUDED."{meta_col}";
+                '''
+
+                await conn.execute(text(query), params)
 
             await conn.commit()
 
-        return hnsw_name_created, bm25_name_created
+        return [row.id for row in rows]
 
-    async def ainit_hybrid_vectorstore_table(
+    # ==========================================
+    # Query Methods
+    # ==========================================
+
+    async def query_hnsw(
         self,
-        table_name: str,
-        vector_size: int,
-        *,
-        schema_name: str = "public",
-        content_column: str = "content",
-        embedding_column: str = "embedding",
-        metadata_column: str = "langchain_metadata",
-        id_column: Union[str, Column, ColumnDict] = "langchain_id",
-        overwrite_existing: bool = False,
-        bm25_index: Optional[BM25Index] = None,
-        hnsw_index: Optional[HNSWIndex] = None,
-        **kwargs,  # Accept but ignore deprecated parameters
-    ) -> None:
-        """Create a table for hybrid search with both HNSW and BM25 indexes."""
-        # If no background loop, call directly; otherwise use _run_as_async
-        if self._loop is None:
-            await self._ainit_hybrid_vectorstore_table(
-                table_name,
-                vector_size,
-                schema_name=schema_name,
-                content_column=content_column,
-                embedding_column=embedding_column,
-                metadata_column=metadata_column,
-                id_column=id_column,
-                overwrite_existing=overwrite_existing,
-                bm25_index=bm25_index,
-                hnsw_index=hnsw_index,
-            )
-        else:
-            await self._run_as_async(
-                self._ainit_hybrid_vectorstore_table(
-                    table_name,
-                    vector_size,
-                    schema_name=schema_name,
-                    content_column=content_column,
-                    embedding_column=embedding_column,
-                    metadata_column=metadata_column,
-                    id_column=id_column,
-                    overwrite_existing=overwrite_existing,
-                    bm25_index=bm25_index,
-                    hnsw_index=hnsw_index,
+        table_config: TableConfig,
+        query_embedding: list[float],
+        dense_config: HNSWSearchConfig,
+        filter_clause: str = "",
+        filter_params: dict | None = None,
+    ) -> Sequence[RowMapping]:
+        """Dense vector search using HNSW index.
+
+        Sets HNSW-specific session parameters (ef_search, iterative_scan)
+        before executing the query.
+        """
+        tc = table_config
+        ds = dense_config.distance_strategy
+
+        columns = [
+            tc.escaped_id_column,
+            tc.escaped_content_column,
+            tc.escaped_embedding_column,
+            tc.escaped_metadata_column,
+        ]
+        column_names = ", ".join(f'"{col}"' for col in columns)
+
+        where = f"WHERE {filter_clause}" if filter_clause else ""
+        embedding_str = str([float(dim) for dim in query_embedding])
+        emb_col = tc.escaped_embedding_column
+        search_fn = ds.search_function
+
+        query = f'''
+            SELECT {column_names},
+                   {search_fn}("{emb_col}", :query_embedding) as distance
+            FROM "{tc.escaped_schema_name}"."{tc.escaped_table_name}"
+            {where}
+            ORDER BY "{emb_col}" {ds.operator} :query_embedding
+            LIMIT :k;
+        '''
+
+        params: dict[str, Any] = {
+            "query_embedding": embedding_str,
+            "k": dense_config.k,
+        }
+        if filter_params:
+            params.update(filter_params)
+
+        async with self._pool.connect() as conn:
+            if dense_config.ef_search is not None:
+                await conn.execute(text(
+                    f"SET LOCAL hnsw.ef_search = {dense_config.ef_search};"
+                ))
+            scan = dense_config.iterative_scan_strategy
+            if scan != IterativeScanStrategy.OFF:
+                await conn.execute(text(
+                    f"SET LOCAL hnsw.iterative_scan = '{scan.value}';"
+                ))
+
+            result = await conn.execute(text(query), params)
+            return result.mappings().fetchall()
+
+    async def query_ivfflat(
+        self,
+        table_config: TableConfig,
+        query_embedding: list[float],
+        dense_config: HNSWSearchConfig,
+        probes: int | None = None,
+        filter_clause: str = "",
+        filter_params: dict | None = None,
+    ) -> Sequence[RowMapping]:
+        """Dense vector search using IVFFlat index.
+
+        Sets IVFFlat-specific session parameter (probes) before executing.
+        """
+        tc = table_config
+        ds = dense_config.distance_strategy
+
+        columns = [
+            tc.escaped_id_column,
+            tc.escaped_content_column,
+            tc.escaped_embedding_column,
+            tc.escaped_metadata_column,
+        ]
+        column_names = ", ".join(f'"{col}"' for col in columns)
+
+        where = f"WHERE {filter_clause}" if filter_clause else ""
+        embedding_str = str([float(dim) for dim in query_embedding])
+        emb_col = tc.escaped_embedding_column
+        search_fn = ds.search_function
+
+        query = f'''
+            SELECT {column_names},
+                   {search_fn}("{emb_col}", :query_embedding) as distance
+            FROM "{tc.escaped_schema_name}"."{tc.escaped_table_name}"
+            {where}
+            ORDER BY "{emb_col}" {ds.operator} :query_embedding
+            LIMIT :k;
+        '''
+
+        params: dict[str, Any] = {
+            "query_embedding": embedding_str,
+            "k": dense_config.k,
+        }
+        if filter_params:
+            params.update(filter_params)
+
+        async with self._pool.connect() as conn:
+            if probes is not None:
+                await conn.execute(
+                    text(f"SET LOCAL ivfflat.probes = {probes};")
                 )
+
+            result = await conn.execute(text(query), params)
+            return result.mappings().fetchall()
+
+    async def query_bm25(
+        self,
+        table_config: TableConfig,
+        query_text: str,
+        sparse_config: BM25SearchConfig,
+        bm25_index_name: str | None = None,
+        filter_clause: str = "",
+        filter_params: dict | None = None,
+    ) -> Sequence[RowMapping]:
+        """Sparse BM25 search using pg_textsearch.
+
+        Uses the <@> operator with to_bm25query() for scoring.
+        Returns negative BM25 scores (lower = better match).
+        """
+        tc = table_config
+
+        if bm25_index_name is None:
+            sanitized = _sanitize_name(tc.table_name)
+            bm25_index_name = f"idx_{sanitized}_bm25"
+
+        columns = [
+            tc.escaped_id_column,
+            tc.escaped_content_column,
+            tc.escaped_metadata_column,
+        ]
+        column_names = ", ".join(f'"{col}"' for col in columns)
+
+        where = f"WHERE {filter_clause}" if filter_clause else ""
+        txt_col = tc.escaped_content_column
+        bm25q = f"to_bm25query(:query_text, '{bm25_index_name}')"
+
+        query = f'''
+            SELECT {column_names},
+                   "{txt_col}" <@> {bm25q} as bm25_score
+            FROM "{tc.escaped_schema_name}"."{tc.escaped_table_name}"
+            {where}
+            ORDER BY "{txt_col}" <@> {bm25q}
+            LIMIT :k;
+        '''
+
+        params: dict[str, Any] = {"query_text": query_text, "k": sparse_config.k}
+        if filter_params:
+            params.update(filter_params)
+
+        async with self._pool.connect() as conn:
+            result = await conn.execute(text(query), params)
+            return result.mappings().fetchall()
+
+    # ==========================================
+    # Database Initialization
+    # ==========================================
+
+    async def init_database(
+        self,
+        table_config: TableConfig,
+        hnsw_config: HNSWIndexConfig | None = None,
+        ivfflat_config: IVFFlatIndexConfig | None = None,
+        bm25_config: BM25IndexConfig | None = None,
+        overwrite_existing: bool = False
+    ):
+        await self.init_table(table_config=table_config, overwrite_existing=overwrite_existing)
+
+        if hnsw_config is not None:
+            await self.create_hnsw_index(
+                table_config=table_config,
+                hnsw_config=hnsw_config
             )
 
-    def init_hybrid_vectorstore_table(
-        self,
-        table_name: str,
-        vector_size: int,
-        *,
-        schema_name: str = "public",
-        content_column: str = "content",
-        embedding_column: str = "embedding",
-        metadata_column: str = "langchain_metadata",
-        id_column: Union[str, Column, ColumnDict] = "langchain_id",
-        overwrite_existing: bool = False,
-        bm25_index: Optional[BM25Index] = None,
-        hnsw_index: Optional[HNSWIndex] = None,
-        **kwargs,  # Accept but ignore deprecated parameters
-    ) -> None:
-        """Create a table for hybrid search with both HNSW and BM25 indexes (sync)."""
-        self._run_as_sync(
-            self._ainit_hybrid_vectorstore_table(
-                table_name,
-                vector_size,
-                schema_name=schema_name,
-                content_column=content_column,
-                embedding_column=embedding_column,
-                metadata_column=metadata_column,
-                id_column=id_column,
-                overwrite_existing=overwrite_existing,
-                bm25_index=bm25_index,
-                hnsw_index=hnsw_index,
+        if ivfflat_config is not None:
+            await self.create_ivfflat_index(
+                table_config=table_config,
+                ivfflat_config=ivfflat_config
             )
-        )
 
-    async def adrop_table(
-        self,
-        table_name: str,
-        *,
-        schema_name: str = "public",
-    ) -> None:
-        """Drop a table (async-friendly version)."""
-        if self._loop is None:
-            # Direct async call
-            await self._adrop_table(table_name=table_name, schema_name=schema_name)
-        else:
-            # Use background loop
-            await super().adrop_table(table_name=table_name, schema_name=schema_name)
+        if bm25_config is not None:
+            await self.create_bm25_index(
+                table_config=table_config,
+                bm25_config=bm25_config
+            )

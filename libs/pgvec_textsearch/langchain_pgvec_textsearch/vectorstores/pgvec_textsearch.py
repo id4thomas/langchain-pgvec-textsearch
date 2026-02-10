@@ -4,54 +4,45 @@ PGVecTextSearch VectorStore - Hybrid Search with pgvector and pg_textsearch.
 Combines:
 - Dense search: pgvector HNSW index
 - Sparse search: pg_textsearch BM25 index
-- Fusion: RRF (Reciprocal Rank Fusion) or weighted sum
+- Fusion: RRF (Reciprocal Rank Fusion)
 """
+
 from __future__ import annotations
 
-import copy
+import asyncio
 import json
 import uuid
-from typing import Any, Callable, Iterable, Optional, Sequence, Union
+from typing import Any, Iterable, Optional, Sequence, Union
 
 import numpy as np
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from sqlalchemy import RowMapping, text
-from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .engine import PGVecTextSearchEngine
-from .indexes import (
-    DEFAULT_DISTANCE_STRATEGY,
-    DEFAULT_INDEX_NAME_SUFFIX,
-    BaseIndex,
-    DistanceStrategy,
-    ExactNearestNeighbor,
-    HNSWIndex,
-    BM25Index,
-    QueryOptions,
+from .config import (
+    SearchConfig,
+    TableConfig,
 )
-from .hybrid_search_config import HybridSearchConfig, reciprocal_rank_fusion
+from .data import Row
+from .engine import AsyncPGVecTextSearchEngine
 from .filters import (
-    FilterOperator,
-    FilterCondition,
     MetadataFilter,
     MetadataFilters,
     build_filter_clause,
 )
+from .search_utils import reciprocal_rank_fusion
 
 
 class PGVecTextSearchStore(VectorStore):
-    """
-    LangChain VectorStore implementation for hybrid search with pgvector + pg_textsearch.
+    """LangChain VectorStore for hybrid search with pgvector + pg_textsearch.
 
-    This implementation provides:
-    - Dense vector search using pgvector HNSW index
-    - Sparse keyword search using pg_textsearch BM25 index
+    Delegates database operations to AsyncPGVecTextSearchEngine.
+
+    Provides:
+    - Dense vector search (HNSW via pgvector)
+    - Sparse keyword search (BM25 via pg_textsearch)
     - Hybrid search combining both with RRF fusion
-
-    Note: This class does NOT inherit from PGVectorStore but implements
-    the LangChain VectorStore interface directly.
     """
 
     __create_key = object()
@@ -59,186 +50,142 @@ class PGVecTextSearchStore(VectorStore):
     def __init__(
         self,
         key: object,
-        engine: AsyncEngine,
+        engine: AsyncPGVecTextSearchEngine,
         embedding_service: Embeddings,
-        table_name: str,
+        table_config: TableConfig,
         *,
-        schema_name: str = "public",
-        content_column: str = "content",
-        embedding_column: str = "embedding",
-        id_column: str = "langchain_id",
-        metadata_column: Optional[str] = "langchain_metadata",
-        distance_strategy: DistanceStrategy = DEFAULT_DISTANCE_STRATEGY,
+        search_config: Optional[SearchConfig] = None,
         k: int = 4,
         fetch_k: int = 20,
         lambda_mult: float = 0.5,
-        index_query_options: Optional[QueryOptions] = None,
-        hybrid_search_config: Optional[HybridSearchConfig] = None,
         insert_batch_size: int = 500,
-        **kwargs,  # Accept but ignore deprecated parameters
     ):
-        """
-        PGVecTextSearchStore constructor.
+        """PGVecTextSearchStore constructor.
 
         Args:
             key: Prevent direct constructor usage.
-            engine: SQLAlchemy AsyncEngine for database connections.
+            engine: AsyncPGVecTextSearchEngine instance.
             embedding_service: Text embedding model.
-            table_name: Name of the table.
-            schema_name: Database schema name. Default: "public".
-            content_column: Column for document content. Default: "content".
-            embedding_column: Column for embeddings. Default: "embedding".
-            id_column: Column for document IDs. Default: "langchain_id".
-            metadata_column: Column for JSON metadata. Default: "langchain_metadata".
-            distance_strategy: Vector distance strategy. Default: COSINE_DISTANCE.
+            table_config: Table schema configuration.
+            search_config: Hybrid search config (includes hnsw/bm25 params).
             k: Number of results to return. Default: 4.
-            fetch_k: Number of results to fetch for MMR. Default: 20.
+            fetch_k: Number of candidates for MMR. Default: 20.
             lambda_mult: MMR diversity parameter. Default: 0.5.
-            index_query_options: Query options for index.
-            hybrid_search_config: Configuration for hybrid search.
-            insert_batch_size: Batch size for bulk insert operations. Default: 500.
+            insert_batch_size: Batch size for bulk inserts. Default: 500.
         """
         if key != PGVecTextSearchStore.__create_key:
             raise Exception(
-                "Only create class through 'create', 'create_sync', or factory methods!"
+                "Only create class through 'create' or 'create_sync'!"
             )
 
         self.engine = engine
         self.embedding_service = embedding_service
-        self.table_name = table_name
-        self.schema_name = schema_name
-        self.content_column = content_column
-        self.embedding_column = embedding_column
-        self.id_column = id_column
-        self.metadata_column = metadata_column
-        self.distance_strategy = distance_strategy
+        self.table_config = table_config
+        self.search_config = search_config or SearchConfig()
         self.k = k
         self.fetch_k = fetch_k
         self.lambda_mult = lambda_mult
-        self.index_query_options = index_query_options
-        self.hybrid_search_config = hybrid_search_config or HybridSearchConfig()
         self.insert_batch_size = insert_batch_size
 
     @classmethod
     async def create(
         cls,
-        engine: PGVecTextSearchEngine,
+        engine: AsyncPGVecTextSearchEngine,
         embedding_service: Embeddings,
-        table_name: str,
-        *,
-        schema_name: str = "public",
-        content_column: str = "content",
-        embedding_column: str = "embedding",
-        id_column: str = "langchain_id",
-        metadata_column: Optional[str] = "langchain_metadata",
-        distance_strategy: DistanceStrategy = DEFAULT_DISTANCE_STRATEGY,
-        k: int = 4,
-        fetch_k: int = 20,
-        lambda_mult: float = 0.5,
-        index_query_options: Optional[QueryOptions] = None,
-        hybrid_search_config: Optional[HybridSearchConfig] = None,
-        insert_batch_size: int = 500,
-        **kwargs,  # Accept but ignore deprecated parameters
+        table_config: TableConfig,
+        **kwargs: Any,
     ) -> PGVecTextSearchStore:
+        """Create a PGVecTextSearchStore instance asynchronously.
+
+        Validates that the table exists with required columns.
         """
-        Create a PGVecTextSearchStore instance asynchronously.
-
-        All document metadata is stored in the langchain_metadata JSON column.
-
-        Args:
-            engine: PGVecTextSearchEngine for database connections.
-            embedding_service: Text embedding model.
-            table_name: Name of an existing table.
-            schema_name: Database schema name. Default: "public".
-            content_column: Column for document content. Default: "content".
-            embedding_column: Column for embeddings. Default: "embedding".
-            id_column: Column for document IDs. Default: "langchain_id".
-            metadata_column: Column for JSON metadata.
-            distance_strategy: Vector distance strategy.
-            k: Number of results to return.
-            fetch_k: Number of results for MMR.
-            lambda_mult: MMR diversity parameter.
-            index_query_options: Query options for index.
-            hybrid_search_config: Configuration for hybrid search.
-            insert_batch_size: Batch size for bulk insert operations. Default: 500.
-
-        Returns:
-            PGVecTextSearchStore instance.
-        """
-        # Get column info from database
+        tc = table_config
         stmt = """
             SELECT column_name, data_type
             FROM information_schema.columns
-            WHERE table_name = :table_name AND table_schema = :schema_name
+            WHERE table_name = :table_name
+              AND table_schema = :schema_name
         """
         async with engine._pool.connect() as conn:
             result = await conn.execute(
                 text(stmt),
-                {"table_name": table_name, "schema_name": schema_name},
+                {
+                    "table_name": tc.table_name,
+                    "schema_name": tc.schema_name,
+                },
             )
             results = result.mappings().fetchall()
 
-        columns = {field["column_name"]: field["data_type"] for field in results}
+        columns = {
+            r["column_name"]: r["data_type"] for r in results
+        }
 
-        # Validate required columns
-        if id_column not in columns:
-            raise ValueError(f"Id column '{id_column}' does not exist.")
-        if content_column not in columns:
-            raise ValueError(f"Content column '{content_column}' does not exist.")
-        if embedding_column not in columns:
-            raise ValueError(f"Embedding column '{embedding_column}' does not exist.")
-
-        content_type = columns[content_column]
-        if content_type != "text" and "char" not in content_type:
+        if tc.id_column not in columns:
             raise ValueError(
-                f"Content column '{content_column}' must be a text type, got {content_type}."
+                f"Id column '{tc.id_column}' does not exist."
             )
-
-        if columns[embedding_column] not in ["USER-DEFINED", "vector"]:
+        if tc.content_column not in columns:
             raise ValueError(
-                f"Embedding column '{embedding_column}' must be a vector type."
+                f"Content column '{tc.content_column}' does not exist."
             )
-
-        metadata_column = (
-            None if metadata_column not in columns else metadata_column
-        )
+        if tc.embedding_column not in columns:
+            raise ValueError(
+                f"Embedding column '{tc.embedding_column}' does not exist."
+            )
 
         return cls(
             cls.__create_key,
-            engine._pool,
+            engine,
             embedding_service,
-            table_name,
-            schema_name=schema_name,
-            content_column=content_column,
-            embedding_column=embedding_column,
-            id_column=id_column,
-            metadata_column=metadata_column,
-            distance_strategy=distance_strategy,
-            k=k,
-            fetch_k=fetch_k,
-            lambda_mult=lambda_mult,
-            index_query_options=index_query_options,
-            hybrid_search_config=hybrid_search_config,
-            insert_batch_size=insert_batch_size,
+            table_config,
+            **kwargs,
         )
 
     @classmethod
     def create_sync(
         cls,
-        engine: PGVecTextSearchEngine,
+        engine: AsyncPGVecTextSearchEngine,
         embedding_service: Embeddings,
-        table_name: str,
+        table_config: TableConfig,
         **kwargs: Any,
     ) -> PGVecTextSearchStore:
         """Create a PGVecTextSearchStore instance synchronously."""
-        return engine._run_as_sync(
-            cls.create(engine, embedding_service, table_name, **kwargs)
+        return asyncio.get_event_loop().run_until_complete(
+            cls.create(engine, embedding_service, table_config, **kwargs)
         )
 
     @property
     def embeddings(self) -> Embeddings:
-        """Return the embedding service."""
         return self.embedding_service
+
+    # ==========================================
+    # Helpers
+    # ==========================================
+
+    def _row_to_document(
+        self,
+        row: dict | RowMapping,
+    ) -> tuple[Document, float]:
+        """Convert a database row to (Document, score)."""
+        tc = self.table_config
+        metadata = row.get(tc.metadata_column, {})
+        if metadata is None:
+            metadata = {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+
+        score = (
+            row.get("rrf_score")
+            or row.get("distance")
+            or row.get("bm25_score", 0.0)
+        )
+
+        doc = Document(
+            page_content=row[tc.content_column],
+            metadata=metadata,
+            id=str(row[tc.id_column]),
+        )
+        return doc, float(score)
 
     # ==========================================
     # Async Methods (Core Implementation)
@@ -252,66 +199,29 @@ class PGVecTextSearchStore(VectorStore):
         ids: Optional[list] = None,
         **kwargs: Any,
     ) -> list[str]:
-        """Add data along with embeddings to the table (bulk insert).
-
-        All metadata from Document is stored in the langchain_metadata JSON column.
-        Uses bulk insert with batching for better performance.
-        """
+        """Add data along with pre-computed embeddings."""
         texts_list = list(texts)
         if not ids:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
-            ids = [id if id is not None else str(uuid.uuid4()) for id in ids]
+            ids = [
+                id_ if id_ is not None else str(uuid.uuid4())
+                for id_ in ids
+            ]
         if not metadatas:
             metadatas = [{} for _ in texts_list]
 
-        # Batch size to avoid too many parameters (PostgreSQL limit ~65535)
-        # Each row has 4 parameters, so insert_batch_size * 4 < 65535
-        insert_batch_size = self.insert_batch_size
+        rows = [
+            Row(id=id_, content=txt, embedding=emb, metadata=meta)
+            for id_, txt, emb, meta
+            in zip(ids, texts_list, embeddings, metadatas)
+        ]
 
-        async with self.engine.connect() as conn:
-            for batch_start in range(0, len(texts_list), insert_batch_size):
-                batch_end = min(batch_start + insert_batch_size, len(texts_list))
-
-                batch_ids = ids[batch_start:batch_end]
-                batch_texts = texts_list[batch_start:batch_end]
-                batch_embeddings = embeddings[batch_start:batch_end]
-                batch_metadatas = metadatas[batch_start:batch_end]
-
-                # Build multi-row VALUES clause
-                values_clauses = []
-                params = {}
-
-                for i, (id_, content, embedding, metadata) in enumerate(
-                    zip(batch_ids, batch_texts, batch_embeddings, batch_metadatas)
-                ):
-                    values_clauses.append(
-                        f"(:id_{i}, :content_{i}, :embedding_{i}, :metadata_{i})"
-                    )
-                    params[f"id_{i}"] = id_
-                    params[f"content_{i}"] = content
-                    params[f"embedding_{i}"] = str([float(dim) for dim in embedding])
-                    params[f"metadata_{i}"] = json.dumps(metadata)
-
-                values_stmt = ", ".join(values_clauses)
-
-                # Build bulk INSERT statement with ON CONFLICT
-                query = f'''
-                    INSERT INTO "{self.schema_name}"."{self.table_name}"
-                    ("{self.id_column}", "{self.content_column}", "{self.embedding_column}", "{self.metadata_column}")
-                    VALUES {values_stmt}
-                    ON CONFLICT ("{self.id_column}") DO UPDATE SET
-                    "{self.content_column}" = EXCLUDED."{self.content_column}",
-                    "{self.embedding_column}" = EXCLUDED."{self.embedding_column}",
-                    "{self.metadata_column}" = EXCLUDED."{self.metadata_column}";
-                '''
-
-                await conn.execute(text(query), params)
-
-            # Commit once after all batches
-            await conn.commit()
-
-        return ids
+        return await self.engine.insert_rows(
+            self.table_config,
+            rows,
+            batch_size=self.insert_batch_size,
+        )
 
     async def aadd_texts(
         self,
@@ -322,9 +232,12 @@ class PGVecTextSearchStore(VectorStore):
     ) -> list[str]:
         """Embed texts and add to the table."""
         texts_list = list(texts)
-        embeddings = await self.embedding_service.aembed_documents(texts_list)
+        embeddings = await self.embedding_service.aembed_documents(
+            texts_list
+        )
         return await self.aadd_embeddings(
-            texts_list, embeddings, metadatas=metadatas, ids=ids, **kwargs
+            texts_list, embeddings,
+            metadatas=metadatas, ids=ids, **kwargs,
         )
 
     async def aadd_documents(
@@ -338,234 +251,147 @@ class PGVecTextSearchStore(VectorStore):
         metadatas = [doc.metadata for doc in documents]
         if not ids:
             ids = [doc.id for doc in documents]
-        return await self.aadd_texts(texts, metadatas=metadatas, ids=ids, **kwargs)
+        return await self.aadd_texts(
+            texts, metadatas=metadatas, ids=ids, **kwargs,
+        )
 
     async def adelete(
         self,
         ids: Optional[list] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
         **kwargs: Any,
     ) -> Optional[bool]:
-        """Delete records from the table."""
-        if not ids and not filter:
+        """Delete records by IDs."""
+        if not ids:
             return False
 
-        where_clauses = []
-        param_dict = {}
+        tc = self.table_config
+        placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
+        param_dict = {f"id_{i}": id_ for i, id_ in enumerate(ids)}
 
-        if ids:
-            placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
-            param_dict.update({f"id_{i}": id_ for i, id_ in enumerate(ids)})
-            where_clauses.append(f'"{self.id_column}" IN ({placeholders})')
+        query = (
+            f'DELETE FROM "{tc.escaped_schema_name}"."{tc.escaped_table_name}"'
+            f' WHERE "{tc.escaped_id_column}" IN ({placeholders})'
+        )
 
-        if filter is not None:
-            filter_clause, filter_params = self._create_filter_clause(filter)
-            if filter_clause:
-                param_dict.update(filter_params)
-                where_clauses.append(filter_clause)
-
-        where_clause = " AND ".join(where_clauses)
-        query = f'DELETE FROM "{self.schema_name}"."{self.table_name}" WHERE {where_clause}'
-
-        async with self.engine.connect() as conn:
+        async with self.engine._pool.connect() as conn:
             await conn.execute(text(query), param_dict)
             await conn.commit()
         return True
 
-    async def _aquery_dense(
+    # ==========================================
+    # Filter Support
+    # ==========================================
+
+    def _resolve_filter(
         self,
-        embedding: list[float],
-        k: int,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
-    ) -> Sequence[RowMapping]:
-        """Perform dense vector search using pgvector."""
-        operator = self.distance_strategy.operator
-        search_function = self.distance_strategy.search_function
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
+    ) -> tuple[str, dict]:
+        """Convert filter to SQL WHERE clause.
 
-        columns = [
-            self.id_column,
-            self.content_column,
-            self.embedding_column,
-            self.metadata_column,
-        ]
-        column_names = ", ".join(f'"{col}"' for col in columns)
-
-        safe_filter, filter_dict = ("", {})
-        if filter is not None:
-            safe_filter, filter_dict = self._create_filter_clause(filter)
-
-        query_embedding = str([float(dim) for dim in embedding])
-        where_filters = f"WHERE {safe_filter}" if safe_filter else ""
-
-        query_stmt = f'''
-            SELECT {column_names},
-                   {search_function}("{self.embedding_column}", :query_embedding) as distance
-            FROM "{self.schema_name}"."{self.table_name}"
-            {where_filters}
-            ORDER BY "{self.embedding_column}" {operator} :query_embedding
-            LIMIT :k;
-        '''
-
-        param_dict = {"query_embedding": query_embedding, "k": k}
-        if filter_dict:
-            param_dict.update(filter_dict)
-
-        async with self.engine.connect() as conn:
-            # Apply index query options
-            if self.index_query_options:
-                for query_option in self.index_query_options.to_parameter():
-                    await conn.execute(text(f"SET LOCAL {query_option};"))
-
-            # Apply HybridSearchConfig HNSW parameters (override index_query_options)
-            if self.hybrid_search_config.ef_search is not None:
-                await conn.execute(
-                    text(f"SET LOCAL hnsw.ef_search = {self.hybrid_search_config.ef_search};")
-                )
-            if self.hybrid_search_config.iterative_scan is not None:
-                await conn.execute(
-                    text(f"SET LOCAL hnsw.iterative_scan = '{self.hybrid_search_config.iterative_scan.value}';")
-                )
-
-            result = await conn.execute(text(query_stmt), param_dict)
-            return result.mappings().fetchall()
-
-    @staticmethod
-    def _sanitize_index_name(name: str) -> str:
-        """Sanitize index name by replacing special characters with underscores
-        and lowercasing.
-
-        PostgreSQL index names with special characters (like hyphens) or uppercase
-        letters can cause issues with pg_textsearch's internal index lookup mechanism.
-        pg_textsearch's internal lookups are case-sensitive and may not match
-        PostgreSQL's identifier handling.
+        Supports:
+        - dict: Uses JSON containment (@>)
+        - MetadataFilter/MetadataFilters: Uses LlamaIndex-style filter syntax
+        - None: No filter
         """
-        sanitized = name.replace("-", "_").replace(" ", "_").lower()
-        return sanitized
+        if filter is None:
+            return "", {}
+        if isinstance(filter, dict):
+            return self.engine.build_filter_clause(self.table_config, filter)
+        return build_filter_clause(
+            filters=filter,
+            json_column=self.table_config.metadata_column,
+        )
 
-    async def _aquery_sparse(
-        self,
-        query: str,
-        k: int,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
-    ) -> Sequence[RowMapping]:
-        """Perform sparse BM25 search using pg_textsearch."""
-        columns = [
-            self.id_column,
-            self.content_column,
-            self.metadata_column,
-        ]
-
-        column_names = ", ".join(f'"{col}"' for col in columns)
-
-        safe_filter, filter_dict = ("", {})
-        if filter is not None:
-            safe_filter, filter_dict = self._create_filter_clause(filter)
-
-        where_filters = f"WHERE {safe_filter}" if safe_filter else ""
-
-        # pg_textsearch uses <@> operator for BM25 scoring
-        # Returns negative BM25 score (lower is better)
-        # Must use to_bm25query with explicit index name for prepared statements
-        # Sanitize the default index name to match how it's created in engine.py
-        if self.hybrid_search_config.bm25_index_name:
-            bm25_index_name = self.hybrid_search_config.bm25_index_name
-        else:
-            sanitized_table_name = self._sanitize_index_name(self.table_name)
-            bm25_index_name = f"idx_{sanitized_table_name}_bm25"
-
-        query_stmt = f'''
-            SELECT {column_names},
-                   "{self.content_column}" <@> to_bm25query(:query_text, '{bm25_index_name}') as bm25_score
-            FROM "{self.schema_name}"."{self.table_name}"
-            {where_filters}
-            ORDER BY "{self.content_column}" <@> to_bm25query(:query_text, '{bm25_index_name}')
-            LIMIT :k;
-        '''
-
-        param_dict = {"query_text": query, "k": k}
-        if filter_dict:
-            param_dict.update(filter_dict)
-
-        async with self.engine.connect() as conn:
-            result = await conn.execute(text(query_stmt), param_dict)
-            return result.mappings().fetchall()
+    # ==========================================
+    # Search Methods
+    # ==========================================
 
     async def _aquery_hybrid(
         self,
         query: str,
         embedding: list[float],
         k: int,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
-    ) -> Sequence[dict[str, Any]]:
+        filter_clause: str = "",
+        filter_params: dict | None = None,
+    ) -> list[dict[str, Any]]:
         """Perform hybrid search combining dense and sparse results."""
-        config = self.hybrid_search_config
+        config = self.search_config
 
         dense_results: Sequence[RowMapping] = []
         sparse_results: Sequence[RowMapping] = []
 
         if config.enable_dense:
-            dense_results = await self._aquery_dense(
-                embedding, config.dense_top_k, filter
+            dense_results = await self.engine.query_hnsw(
+                self.table_config,
+                embedding,
+                self.search_config.hnsw,
+                filter_clause,
+                filter_params,
             )
 
         if config.enable_sparse:
-            sparse_results = await self._aquery_sparse(
-                query, config.sparse_top_k, filter
+            sparse_results = await self.engine.query_bm25(
+                self.table_config,
+                query,
+                self.search_config.bm25,
+                filter_clause=filter_clause,
+                filter_params=filter_params,
             )
 
-        # If only one type is enabled, return those results directly
+        # If only one type is enabled, return directly
         if not config.enable_sparse:
             return [dict(row) for row in dense_results[:k]]
         if not config.enable_dense:
             return [dict(row) for row in sparse_results[:k]]
 
         # Fuse results
-        fusion_params = {
-            **config.fusion_function_parameters,
-            "dense_weight": config.dense_weight,
-            "sparse_weight": config.sparse_weight,
-            "fetch_top_k": k,
-            "distance_strategy": self.distance_strategy,
-            "id_column": self.id_column,
-        }
-        return config.fusion_function(dense_results, sparse_results, **fusion_params)
+        return reciprocal_rank_fusion(
+            dense_results,
+            sparse_results,
+            id_column=self.table_config.id_column,
+            fetch_top_k=k,
+        )
 
     async def asimilarity_search(
         self,
         query: str,
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Return docs selected by similarity search on query."""
         embedding = await self.embedding_service.aembed_query(text=query)
         return await self.asimilarity_search_by_vector(
-            embedding=embedding, k=k, filter=filter, query=query, **kwargs
+            embedding=embedding, k=k, filter=filter,
+            query=query, **kwargs,
         )
 
     async def asimilarity_search_with_score(
         self,
         query: str,
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
-        """Return docs and scores selected by similarity search on query."""
+        """Return docs and scores selected by similarity search."""
         embedding = await self.embedding_service.aembed_query(text=query)
         return await self.asimilarity_search_with_score_by_vector(
-            embedding=embedding, k=k, filter=filter, query=query, **kwargs
+            embedding=embedding, k=k, filter=filter,
+            query=query, **kwargs,
         )
 
     async def asimilarity_search_by_vector(
         self,
         embedding: list[float],
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return docs selected by vector similarity search."""
-        docs_and_scores = await self.asimilarity_search_with_score_by_vector(
-            embedding=embedding, k=k, filter=filter, **kwargs
+        """Return docs selected by vector similarity."""
+        docs_and_scores = (
+            await self.asimilarity_search_with_score_by_vector(
+                embedding=embedding, k=k, filter=filter, **kwargs,
+            )
         )
         return [doc for doc, _ in docs_and_scores]
 
@@ -573,48 +399,31 @@ class PGVecTextSearchStore(VectorStore):
         self,
         embedding: list[float],
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
-        """Return docs and scores selected by vector similarity search."""
+        """Return docs and scores selected by vector similarity."""
         final_k = k if k is not None else self.k
-        query = kwargs.get("query", "")
+        query_text = kwargs.get("query", "")
+        filter_clause, filter_params = self._resolve_filter(filter)
 
-        # Use hybrid search if query text is available and sparse is enabled
-        if query and self.hybrid_search_config.enable_sparse:
-            results = await self._aquery_hybrid(query, embedding, final_k, filter)
+        # Use hybrid search if query text available and sparse enabled
+        if query_text and self.search_config.enable_sparse:
+            results = await self._aquery_hybrid(
+                query_text, embedding, final_k,
+                filter_clause, filter_params,
+            )
         else:
-            results = await self._aquery_dense(embedding, final_k, filter)
-
-        documents_with_scores = []
-        for row in results:
-            # All metadata is stored in langchain_metadata JSON column
-            metadata = (
-                row.get(self.metadata_column, {})
-                if self.metadata_column
-                else {}
+            # Dense-only: override config k with requested k
+            config = self.search_config.hnsw.model_copy(
+                update={"k": final_k}
             )
-            if metadata is None:
-                metadata = {}
-            # Handle case where JSON column returns a string instead of dict
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-
-            # Get score (RRF score, distance, or BM25 score)
-            score = row.get("rrf_score") or row.get("distance") or row.get("bm25_score", 0.0)
-
-            documents_with_scores.append(
-                (
-                    Document(
-                        page_content=row[self.content_column],
-                        metadata=metadata,
-                        id=str(row[self.id_column]),
-                    ),
-                    float(score),
-                )
+            results = await self.engine.query_hnsw(
+                self.table_config, embedding, config,
+                filter_clause, filter_params,
             )
 
-        return documents_with_scores
+        return [self._row_to_document(row) for row in results]
 
     async def amax_marginal_relevance_search(
         self,
@@ -622,10 +431,10 @@ class PGVecTextSearchStore(VectorStore):
         k: Optional[int] = None,
         fetch_k: Optional[int] = None,
         lambda_mult: Optional[float] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return docs selected using maximal marginal relevance."""
+        """Return docs using maximal marginal relevance."""
         embedding = await self.embedding_service.aembed_query(text=query)
         return await self.amax_marginal_relevance_search_by_vector(
             embedding=embedding,
@@ -642,24 +451,37 @@ class PGVecTextSearchStore(VectorStore):
         k: Optional[int] = None,
         fetch_k: Optional[int] = None,
         lambda_mult: Optional[float] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
-        """Return docs selected using maximal marginal relevance by vector."""
+        """Return docs using maximal marginal relevance by vector."""
         final_k = k if k is not None else self.k
         final_fetch_k = fetch_k if fetch_k is not None else self.fetch_k
-        final_lambda = lambda_mult if lambda_mult is not None else self.lambda_mult
+        final_lambda = (
+            lambda_mult if lambda_mult is not None else self.lambda_mult
+        )
+        filter_clause, filter_params = self._resolve_filter(filter)
 
         # Fetch more candidates for MMR
-        results = await self._aquery_dense(embedding, final_fetch_k, filter)
+        config = self.search_config.hnsw.model_copy(
+            update={"k": final_fetch_k}
+        )
+        results = await self.engine.query_hnsw(
+            self.table_config, embedding, config,
+            filter_clause, filter_params,
+        )
 
         if not results:
             return []
 
-        # Extract embeddings for MMR calculation
-        embedding_list = [json.loads(row[self.embedding_column]) for row in results]
+        tc = self.table_config
+        embedding_list = [
+            json.loads(row[tc.embedding_column])
+            for row in results
+        ]
 
         from langchain_core.vectorstores import utils as langchain_utils
+
         mmr_selected = langchain_utils.maximal_marginal_relevance(
             np.array(embedding, dtype=np.float32),
             embedding_list,
@@ -670,212 +492,40 @@ class PGVecTextSearchStore(VectorStore):
         documents = []
         for i, row in enumerate(results):
             if i in mmr_selected:
-                # All metadata is stored in langchain_metadata JSON column
-                metadata = (
-                    row.get(self.metadata_column, {})
-                    if self.metadata_column
-                    else {}
-                )
-                if metadata is None:
-                    metadata = {}
-                # Handle case where JSON column returns a string instead of dict
-                if isinstance(metadata, str):
-                    metadata = json.loads(metadata)
-                documents.append(
-                    Document(
-                        page_content=row[self.content_column],
-                        metadata=metadata,
-                        id=str(row[self.id_column]),
-                    )
-                )
+                doc, _ = self._row_to_document(row)
+                documents.append(doc)
 
         return documents
 
-    async def aget_by_ids(self, ids: Sequence[str]) -> list[Document]:
+    async def aget_by_ids(
+        self,
+        ids: Sequence[str],
+    ) -> list[Document]:
         """Get documents by IDs."""
-        columns = [self.id_column, self.content_column, self.metadata_column]
-
+        tc = self.table_config
+        columns = [
+            tc.escaped_id_column,
+            tc.escaped_content_column,
+            tc.escaped_metadata_column,
+        ]
         column_names = ", ".join(f'"{col}"' for col in columns)
         placeholders = ", ".join(f":id_{i}" for i in range(len(ids)))
         param_dict = {f"id_{i}": id_ for i, id_ in enumerate(ids)}
 
         query = f'''
             SELECT {column_names}
-            FROM "{self.schema_name}"."{self.table_name}"
-            WHERE "{self.id_column}" IN ({placeholders});
+            FROM "{tc.escaped_schema_name}"."{tc.escaped_table_name}"
+            WHERE "{tc.escaped_id_column}" IN ({placeholders});
         '''
 
-        async with self.engine.connect() as conn:
+        async with self.engine._pool.connect() as conn:
             result = await conn.execute(text(query), param_dict)
             results = result.mappings().fetchall()
 
-        documents = []
-        for row in results:
-            # All metadata is stored in langchain_metadata JSON column
-            metadata = (
-                row.get(self.metadata_column, {})
-                if self.metadata_column
-                else {}
-            )
-            if metadata is None:
-                metadata = {}
-            # Handle case where JSON column returns a string instead of dict
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            documents.append(
-                Document(
-                    page_content=row[self.content_column],
-                    metadata=metadata,
-                    id=str(row[self.id_column]),
-                )
-            )
-
-        return documents
+        return [self._row_to_document(row)[0] for row in results]
 
     # ==========================================
-    # Index Management
-    # ==========================================
-
-    async def aapply_vector_index(
-        self,
-        index: BaseIndex,
-        name: Optional[str] = None,
-        concurrently: bool = False,
-    ) -> None:
-        """Create a vector index on the table."""
-        if isinstance(index, ExactNearestNeighbor):
-            await self.adrop_vector_index()
-            return
-
-        if index.extension_name:
-            async with self.engine.connect() as conn:
-                await conn.execute(
-                    text(f"CREATE EXTENSION IF NOT EXISTS {index.extension_name}")
-                )
-                await conn.commit()
-
-        function = index.get_index_function()
-        filter_clause = f"WHERE ({index.partial_indexes})" if index.partial_indexes else ""
-        params = "WITH " + index.index_options()
-
-        if name is None:
-            name = index.name or self.table_name + DEFAULT_INDEX_NAME_SUFFIX
-
-        stmt = f'''
-            CREATE INDEX {"CONCURRENTLY" if concurrently else ""} "{name}"
-            ON "{self.schema_name}"."{self.table_name}"
-            USING {index.index_type} ("{self.embedding_column}" {function})
-            {params} {filter_clause};
-        '''
-
-        async with self.engine.connect() as conn:
-            if concurrently:
-                autocommit_conn = await conn.execution_options(
-                    isolation_level="AUTOCOMMIT"
-                )
-                await autocommit_conn.execute(text(stmt))
-            else:
-                await conn.execute(text(stmt))
-                await conn.commit()
-
-    async def aapply_bm25_index(
-        self,
-        index: BM25Index,
-        name: Optional[str] = None,
-        concurrently: bool = False,
-    ) -> None:
-        """Create a BM25 index on the content column for pg_textsearch."""
-        if name is None:
-            if index.name:
-                name = index.name
-            else:
-                sanitized_table_name = self._sanitize_index_name(self.table_name)
-                name = f"idx_{sanitized_table_name}_bm25"
-
-        stmt = f'''
-            CREATE INDEX {"CONCURRENTLY" if concurrently else ""} "{name}"
-            ON "{self.schema_name}"."{self.table_name}"
-            USING bm25 ("{self.content_column}")
-            WITH {index.index_options()};
-        '''
-
-        async with self.engine.connect() as conn:
-            if concurrently:
-                autocommit_conn = await conn.execution_options(
-                    isolation_level="AUTOCOMMIT"
-                )
-                await autocommit_conn.execute(text(stmt))
-            else:
-                await conn.execute(text(stmt))
-                await conn.commit()
-
-    async def adrop_vector_index(self, index_name: Optional[str] = None) -> None:
-        """Drop the vector index."""
-        index_name = index_name or self.table_name + DEFAULT_INDEX_NAME_SUFFIX
-        query = f'DROP INDEX IF EXISTS "{self.schema_name}"."{index_name}";'
-        async with self.engine.connect() as conn:
-            await conn.execute(text(query))
-            await conn.commit()
-
-    async def adrop_bm25_index(self, index_name: Optional[str] = None) -> None:
-        """Drop the BM25 index."""
-        if index_name is None:
-            sanitized_table_name = self._sanitize_index_name(self.table_name)
-            index_name = f"idx_{sanitized_table_name}_bm25"
-        query = f'DROP INDEX IF EXISTS "{self.schema_name}"."{index_name}";'
-        async with self.engine.connect() as conn:
-            await conn.execute(text(query))
-            await conn.commit()
-
-    # ==========================================
-    # Filter Support
-    # ==========================================
-
-    def _create_filter_clause(
-        self,
-        filters: Union[MetadataFilters, MetadataFilter, None],
-    ) -> tuple[str, dict]:
-        """
-        Convert filters to SQL WHERE clause.
-
-        Uses MetadataFilter/MetadataFilters objects for type-safe filtering.
-
-        Filter Operators (FilterOperator):
-        - Comparison: EQ (==), NE (!=), LT (<), LTE (<=), GT (>), GTE (>=)
-        - Array: IN, NIN, ANY, ALL, CONTAINS
-        - Text: TEXT_MATCH (LIKE), TEXT_MATCH_INSENSITIVE (ILIKE)
-        - Range: BETWEEN
-        - Existence: EXISTS, IS_EMPTY
-
-        Logical Conditions (FilterCondition):
-        - AND, OR, NOT
-
-        Args:
-            filters: MetadataFilters or MetadataFilter object.
-
-        Returns:
-            Tuple of (SQL WHERE clause, parameter dict).
-
-        Example:
-            # Single filter
-            filter = MetadataFilter(key="category", value="tech", operator=FilterOperator.EQ)
-
-            # Multiple filters with AND
-            filters = MetadataFilters(
-                filters=[
-                    MetadataFilter(key="category", value="tech", operator=FilterOperator.EQ),
-                    MetadataFilter(key="year", value=2024, operator=FilterOperator.GTE),
-                ],
-                condition=FilterCondition.AND
-            )
-        """
-        return build_filter_clause(
-            filters=filters,
-            json_column=self.metadata_column,
-        )
-
-    # ==========================================
-    # Sync Interface (Wrappers)
+    # Sync Wrappers
     # ==========================================
 
     def add_texts(
@@ -886,7 +536,6 @@ class PGVecTextSearchStore(VectorStore):
         **kwargs: Any,
     ) -> list[str]:
         """Add texts to the vectorstore (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
             self.aadd_texts(texts, metadatas, ids, **kwargs)
         )
@@ -898,7 +547,6 @@ class PGVecTextSearchStore(VectorStore):
         **kwargs: Any,
     ) -> list[str]:
         """Add documents to the vectorstore (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
             self.aadd_documents(documents, ids, **kwargs)
         )
@@ -906,24 +554,21 @@ class PGVecTextSearchStore(VectorStore):
     def delete(
         self,
         ids: Optional[list] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
         **kwargs: Any,
     ) -> Optional[bool]:
         """Delete from the vectorstore (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
-            self.adelete(ids, filter, **kwargs)
+            self.adelete(ids, **kwargs)
         )
 
     def similarity_search(
         self,
         query: str,
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Return docs selected by similarity search (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
             self.asimilarity_search(query, k, filter, **kwargs)
         )
@@ -932,39 +577,42 @@ class PGVecTextSearchStore(VectorStore):
         self,
         query: str,
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         """Return docs and scores (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
-            self.asimilarity_search_with_score(query, k, filter, **kwargs)
+            self.asimilarity_search_with_score(
+                query, k, filter, **kwargs,
+            )
         )
 
     def similarity_search_by_vector(
         self,
         embedding: list[float],
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Return docs selected by vector (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
-            self.asimilarity_search_by_vector(embedding, k, filter, **kwargs)
+            self.asimilarity_search_by_vector(
+                embedding, k, filter, **kwargs,
+            )
         )
 
     def similarity_search_with_score_by_vector(
         self,
         embedding: list[float],
         k: Optional[int] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         """Return docs and scores by vector (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
-            self.asimilarity_search_with_score_by_vector(embedding, k, filter, **kwargs)
+            self.asimilarity_search_with_score_by_vector(
+                embedding, k, filter, **kwargs,
+            )
         )
 
     def max_marginal_relevance_search(
@@ -973,14 +621,13 @@ class PGVecTextSearchStore(VectorStore):
         k: Optional[int] = None,
         fetch_k: Optional[int] = None,
         lambda_mult: Optional[float] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Return docs using MMR (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
             self.amax_marginal_relevance_search(
-                query, k, fetch_k, lambda_mult, filter, **kwargs
+                query, k, fetch_k, lambda_mult, filter, **kwargs,
             )
         )
 
@@ -990,21 +637,21 @@ class PGVecTextSearchStore(VectorStore):
         k: Optional[int] = None,
         fetch_k: Optional[int] = None,
         lambda_mult: Optional[float] = None,
-        filter: Optional[Union[MetadataFilters, MetadataFilter]] = None,
+        filter: Union[dict, MetadataFilter, MetadataFilters, None] = None,
         **kwargs: Any,
     ) -> list[Document]:
         """Return docs using MMR by vector (sync)."""
-        import asyncio
         return asyncio.get_event_loop().run_until_complete(
             self.amax_marginal_relevance_search_by_vector(
-                embedding, k, fetch_k, lambda_mult, filter, **kwargs
+                embedding, k, fetch_k, lambda_mult, filter, **kwargs,
             )
         )
 
     def get_by_ids(self, ids: Sequence[str]) -> list[Document]:
         """Get documents by IDs (sync)."""
-        import asyncio
-        return asyncio.get_event_loop().run_until_complete(self.aget_by_ids(ids))
+        return asyncio.get_event_loop().run_until_complete(
+            self.aget_by_ids(ids)
+        )
 
     # ==========================================
     # Factory Methods
@@ -1015,15 +662,17 @@ class PGVecTextSearchStore(VectorStore):
         cls,
         texts: list[str],
         embedding: Embeddings,
-        engine: PGVecTextSearchEngine,
-        table_name: str,
+        engine: AsyncPGVecTextSearchEngine,
+        table_config: TableConfig,
         *,
         metadatas: Optional[list[dict]] = None,
         ids: Optional[list] = None,
         **kwargs: Any,
     ) -> PGVecTextSearchStore:
         """Create a PGVecTextSearchStore from texts."""
-        vs = await cls.create(engine, embedding, table_name, **kwargs)
+        vs = await cls.create(
+            engine, embedding, table_config, **kwargs,
+        )
         await vs.aadd_texts(texts, metadatas=metadatas, ids=ids)
         return vs
 
@@ -1032,14 +681,16 @@ class PGVecTextSearchStore(VectorStore):
         cls,
         documents: list[Document],
         embedding: Embeddings,
-        engine: PGVecTextSearchEngine,
-        table_name: str,
+        engine: AsyncPGVecTextSearchEngine,
+        table_config: TableConfig,
         *,
         ids: Optional[list] = None,
         **kwargs: Any,
     ) -> PGVecTextSearchStore:
         """Create a PGVecTextSearchStore from documents."""
-        vs = await cls.create(engine, embedding, table_name, **kwargs)
+        vs = await cls.create(
+            engine, embedding, table_config, **kwargs,
+        )
         await vs.aadd_documents(documents, ids=ids)
         return vs
 
@@ -1048,13 +699,15 @@ class PGVecTextSearchStore(VectorStore):
         cls,
         texts: list[str],
         embedding: Embeddings,
-        engine: PGVecTextSearchEngine,
-        table_name: str,
+        engine: AsyncPGVecTextSearchEngine,
+        table_config: TableConfig,
         **kwargs: Any,
     ) -> PGVecTextSearchStore:
         """Create a PGVecTextSearchStore from texts (sync)."""
-        return engine._run_as_sync(
-            cls.afrom_texts(texts, embedding, engine, table_name, **kwargs)
+        return asyncio.get_event_loop().run_until_complete(
+            cls.afrom_texts(
+                texts, embedding, engine, table_config, **kwargs,
+            )
         )
 
     @classmethod
@@ -1062,11 +715,13 @@ class PGVecTextSearchStore(VectorStore):
         cls,
         documents: list[Document],
         embedding: Embeddings,
-        engine: PGVecTextSearchEngine,
-        table_name: str,
+        engine: AsyncPGVecTextSearchEngine,
+        table_config: TableConfig,
         **kwargs: Any,
     ) -> PGVecTextSearchStore:
         """Create a PGVecTextSearchStore from documents (sync)."""
-        return engine._run_as_sync(
-            cls.afrom_documents(documents, embedding, engine, table_name, **kwargs)
+        return asyncio.get_event_loop().run_until_complete(
+            cls.afrom_documents(
+                documents, embedding, engine, table_config, **kwargs,
+            )
         )

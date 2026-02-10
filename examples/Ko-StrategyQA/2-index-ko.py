@@ -12,14 +12,15 @@ from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pgvec_textsearch import (
     PGVecTextSearchStore,
-    PGVecTextSearchEngine,
-    HybridSearchConfig,
+    AsyncPGVecTextSearchEngine,
+    TableConfig,
+    SearchConfig,
+    HNSWIndexConfig,
+    BM25IndexConfig,
+    HNSWSearchConfig,
+    BM25SearchConfig,
     DistanceStrategy,
-    HNSWIndex,
-    BM25Index,
-    reciprocal_rank_fusion
 )
-from langchain_postgres import Column
 
 from config import settings
 
@@ -38,26 +39,25 @@ DATABASE_URL = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
 
 async def main():
     # Initialize PG DB
-    engine = PGVecTextSearchEngine.from_connection_string_async(DATABASE_URL)
+    engine = AsyncPGVecTextSearchEngine.from_connection_string(DATABASE_URL)
 
-    await engine.adrop_table(TABLE_NAME)
-
-    # Create table with indexes
-    await engine.ainit_hybrid_vectorstore_table(
+    table_config = TableConfig(
         table_name=TABLE_NAME,
         vector_size=settings.embedding_dim,
-        metadata_columns=[
-            Column("corpus_id", "TEXT"),
-            Column("corpus_title", "TEXT"),
-        ],
-        hnsw_index=HNSWIndex(
+    )
+
+    # Create table with indexes
+    await engine.init_database(
+        table_config=table_config,
+        hnsw_config=HNSWIndexConfig(
             m=32,
             ef_construction=128,
             distance_strategy=DistanceStrategy.COSINE_DISTANCE,
         ),
-        bm25_index=BM25Index(
+        bm25_config=BM25IndexConfig(
             text_config=TEXT_CONFIG,
         ),
+        overwrite_existing=True,
     )
 
     # Create VectorStore
@@ -73,15 +73,17 @@ async def main():
     store = await PGVecTextSearchStore.create(
         engine=engine,
         embedding_service=embedding_service,
-        table_name=TABLE_NAME,
-        # hybrid_search_config=HybridSearchConfig(
-        #     enable_dense=True,
-        #     enable_sparse=True,
-        #     dense_top_k=20,
-        #     sparse_top_k=20,
-        #     fusion_function=reciprocal_rank_fusion,
-        #     fusion_function_parameters={"rrf_k": 60},
-        # ),
+        table_config=table_config,
+        search_config=SearchConfig(
+            enable_dense=True,
+            enable_sparse=True,
+            hnsw=HNSWSearchConfig(
+                distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+            ),
+            bm25=BM25SearchConfig(
+                text_config=TEXT_CONFIG,
+            ),
+        ),
     )
 
     # Prepare Documents (Korean)
@@ -129,6 +131,8 @@ async def main():
     print(f"\nIndexing complete: {len(docs)} Korean documents indexed")
     print(f"Table: {TABLE_NAME}")
     print(f"BM25 text_config: {TEXT_CONFIG}")
+
+    await engine.close()
 
 
 if __name__ == "__main__":

@@ -18,9 +18,12 @@ from datasets import load_dataset
 from langchain_openai import OpenAIEmbeddings
 from langchain_pgvec_textsearch import (
     PGVecTextSearchStore,
-    PGVecTextSearchEngine,
-    HybridSearchConfig,
-    reciprocal_rank_fusion,
+    AsyncPGVecTextSearchEngine,
+    TableConfig,
+    SearchConfig,
+    HNSWSearchConfig,
+    BM25SearchConfig,
+    DistanceStrategy,
 )
 from tqdm.asyncio import tqdm as atqdm
 import pandas as pd
@@ -161,57 +164,51 @@ def load_evaluation_data(data_dir: str, split: str = "dev", query_lang: str = "k
 # # Search Configurations
 
 # %%
-def get_search_configs() -> dict[str, HybridSearchConfig]:
+def get_search_configs() -> dict[str, SearchConfig]:
     """Define search configurations for Korean evaluation."""
     return {
-        "dense": HybridSearchConfig(
+        "dense": SearchConfig(
             enable_dense=True,
             enable_sparse=False,
-            ef_search=128,
+            hnsw=HNSWSearchConfig(
+                ef_search=128,
+                distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+            ),
+            bm25=BM25SearchConfig(text_config=TEXT_CONFIG),
         ),
-        "sparse (BM25 korean)": HybridSearchConfig(
+        "sparse (BM25 korean)": SearchConfig(
             enable_dense=False,
             enable_sparse=True,
+            hnsw=HNSWSearchConfig(
+                distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+            ),
+            bm25=BM25SearchConfig(text_config=TEXT_CONFIG),
         ),
-        "hybrid (RRF k=60)": HybridSearchConfig(
+        "hybrid (RRF k=60)": SearchConfig(
             enable_dense=True,
             enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-            ef_search=128,
+            hnsw=HNSWSearchConfig(
+                k=100,
+                ef_search=128,
+                distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+            ),
+            bm25=BM25SearchConfig(
+                k=100,
+                text_config=TEXT_CONFIG,
+            ),
         ),
-        "hybrid (RRF k=60, d=0.7)": HybridSearchConfig(
+        "hybrid (RRF k=20)": SearchConfig(
             enable_dense=True,
             enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            dense_weight=0.7,
-            sparse_weight=0.3,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=30, d=0.7)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            dense_weight=0.7,
-            sparse_weight=0.3,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 30},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=20)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 20},
-            ef_search=128,
+            hnsw=HNSWSearchConfig(
+                k=100,
+                ef_search=128,
+                distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+            ),
+            bm25=BM25SearchConfig(
+                k=100,
+                text_config=TEXT_CONFIG,
+            ),
         ),
     }
 
@@ -221,10 +218,11 @@ def get_search_configs() -> dict[str, HybridSearchConfig]:
 
 # %%
 async def evaluate_config(
-    engine: PGVecTextSearchEngine,
+    engine: AsyncPGVecTextSearchEngine,
     embedding_service,
+    table_config: TableConfig,
     config_name: str,
-    config: HybridSearchConfig,
+    config: SearchConfig,
     qrels_dict: dict[str, set[str]],
     queries_dict: dict[str, str],
     k_values: list[int],
@@ -233,8 +231,8 @@ async def evaluate_config(
     store = await PGVecTextSearchStore.create(
         engine=engine,
         embedding_service=embedding_service,
-        table_name=TABLE_NAME,
-        hybrid_search_config=config,
+        table_config=table_config,
+        search_config=config,
     )
 
     results_by_k = {k: defaultdict(list) for k in k_values}
@@ -278,7 +276,12 @@ async def evaluate_config(
 # %%
 async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
     """Run Korean evaluation."""
-    engine = PGVecTextSearchEngine.from_connection_string_async(DATABASE_URL)
+    engine = AsyncPGVecTextSearchEngine.from_connection_string(DATABASE_URL)
+
+    table_config = TableConfig(
+        table_name=TABLE_NAME,
+        vector_size=settings.embedding_dim,
+    )
 
     print(f"=== Korean Evaluation (text_config: {TEXT_CONFIG}) ===")
     print(f"Table: {TABLE_NAME}")
@@ -306,6 +309,7 @@ async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
         results = await evaluate_config(
             engine=engine,
             embedding_service=embedding_service,
+            table_config=table_config,
             config_name=config_name,
             config=config,
             qrels_dict=qrels_dict,
@@ -314,6 +318,7 @@ async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
         )
         all_results[config_name] = results
 
+    await engine.close()
     return all_results
 
 

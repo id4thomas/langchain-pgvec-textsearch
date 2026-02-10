@@ -1,21 +1,18 @@
 """PGVecTextSearch VectorStore package."""
+
 from .pgvec_textsearch import PGVecTextSearchStore
-from .engine import PGVecTextSearchEngine
-from .hybrid_search_config import (
-    HybridSearchConfig,
-    reciprocal_rank_fusion,
-    weighted_sum_ranking,
+from .engine import AsyncPGVecTextSearchEngine
+from .config import (
+    TableConfig,
+    SearchConfig,
+    HNSWIndexConfig,
+    IVFFlatIndexConfig,
+    BM25IndexConfig,
+    HNSWSearchConfig,
+    BM25SearchConfig,
 )
-from .indexes import (
-    DistanceStrategy,
-    QueryOptions,
-    IterativeScanMode,
-    BaseIndex,
-    HNSWIndex,
-    IVFFlatIndex,
-    ExactNearestNeighbor,
-    BM25Index,
-)
+from .data import Row
+from .search_utils import reciprocal_rank_fusion
 from .filters import (
     FilterOperator,
     FilterCondition,
@@ -23,24 +20,37 @@ from .filters import (
     MetadataFilters,
     build_filter_clause,
 )
+from .types import (
+    Column,
+    ColumnDict,
+    DistanceStrategy,
+    FusionStrategy,
+    IterativeScanStrategy,
+)
 
 __all__ = [
     # Main classes
     "PGVecTextSearchStore",
-    "PGVecTextSearchEngine",
-    # Configuration
-    "HybridSearchConfig",
-    "reciprocal_rank_fusion",
-    "weighted_sum_ranking",
-    # Indexes
+    "AsyncPGVecTextSearchEngine",
+    # Table & Data
+    "TableConfig",
+    "Row",
+    "Column",
+    "ColumnDict",
+    # Index configs
+    "HNSWIndexConfig",
+    "IVFFlatIndexConfig",
+    "BM25IndexConfig",
+    # Search configs
+    "SearchConfig",
+    "HNSWSearchConfig",
+    "BM25SearchConfig",
+    # Types
     "DistanceStrategy",
-    "QueryOptions",
-    "IterativeScanMode",
-    "BaseIndex",
-    "HNSWIndex",
-    "IVFFlatIndex",
-    "ExactNearestNeighbor",
-    "BM25Index",
+    "FusionStrategy",
+    "IterativeScanStrategy",
+    # Search utils
+    "reciprocal_rank_fusion",
     # Filters
     "FilterOperator",
     "FilterCondition",
