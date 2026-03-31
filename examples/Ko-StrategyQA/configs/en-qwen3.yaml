@@ -1,0 +1,24 @@
+# Ko-StrategyQA / English / Qwen3-Embedding
+dataset:
+  data_name: KoStrategyQA
+  table_name: KoStrategyQA-documents-en
+  corpus_lang: en
+  query_lang: en
+  text_config: english
+  max_length: 8000
+
+embedding:
+  model: Qwen3-Embedding-0.6B
+  base_url: "http://localhost:910/v1"
+  api_key: sk-abc
+  dim: 1024
+
+index:
+  hnsw:
+    m: 32
+    ef_construction: 128
+    distance_strategy: COSINE_DISTANCE
+  bm25:
+    text_config: english
+  batch_size: 64
+  concurrency: 16

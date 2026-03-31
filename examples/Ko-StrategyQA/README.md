@@ -2,6 +2,16 @@
 한국어 ODQA multi-hop 검색 데이터셋 (StrategyQA 번역)
 - huggingface [taeminlee/Ko-StrategyQA](https://huggingface.co/datasets/taeminlee/Ko-StrategyQA)
 
+## Usage
+```
+# Index
+python 2-index.py --config configs/ko-qwen3.yaml
+
+# Evaluate
+python 3-evaluate.py --index-config configs/ko-qwen3.yaml --eval-config configs/evaluate.yaml
+
+```
+
 
 ## Perf
 ### Summary
