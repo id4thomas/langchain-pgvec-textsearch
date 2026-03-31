@@ -70,3 +70,72 @@ def reciprocal_rank_fusion(
         results.append(row_data)
 
     return results
+
+
+def weighted_sum_ranking(
+    dense_results: Sequence[RowMapping],
+    sparse_results: Sequence[RowMapping],
+    *,
+    id_column: str,
+    fetch_top_k: int,
+    dense_weight: float = 0.7,
+    sparse_weight: float = 0.3,
+) -> list[dict[str, Any]]:
+    """Combine dense and sparse results using Weighted Sum Ranking.
+
+    Normalizes scores from each result list to [0, 1] using min-max normalization,
+    then combines them with weights. Higher weighted score = more relevant.
+
+    Dense results use 'distance' (lower = better), so the scale is inverted.
+    Sparse results use 'bm25_score' (negative BM25, lower = better), also inverted.
+
+    Args:
+        dense_results: Results from dense vector search (ordered by distance).
+        sparse_results: Results from sparse BM25 search (ordered by bm25_score).
+        id_column: Name of the ID column.
+        fetch_top_k: Number of top results to return.
+        dense_weight: Weight for dense results (default 0.7).
+        sparse_weight: Weight for sparse results (default 0.3).
+
+    Returns:
+        Fused results sorted by weighted score descending.
+    """
+    scored: dict[str, dict[str, Any]] = {}
+
+    # Normalize dense scores (distance: lower = better → invert)
+    dense_list = [dict(row) for row in dense_results]
+    if dense_list:
+        scores = [row["distance"] for row in dense_list]
+        min_s, max_s = min(scores), max(scores)
+        rng = max_s - min_s if max_s != min_s else 1.0
+
+        for item in dense_list:
+            normalized = (item["distance"] - min_s) / rng
+            doc_id = str(item[id_column])
+            item["weighted_score"] = (1.0 - normalized) * dense_weight
+            scored[doc_id] = item
+
+    # Normalize sparse scores (bm25_score: lower = better → invert)
+    sparse_list = [dict(row) for row in sparse_results]
+    if sparse_list:
+        scores = [row["bm25_score"] for row in sparse_list]
+        min_s, max_s = min(scores), max(scores)
+        rng = max_s - min_s if max_s != min_s else 1.0
+
+        for item in sparse_list:
+            normalized = (item["bm25_score"] - min_s) / rng
+            sparse_score = (1.0 - normalized) * sparse_weight
+            doc_id = str(item[id_column])
+            if doc_id in scored:
+                scored[doc_id]["weighted_score"] += sparse_score
+            else:
+                item["weighted_score"] = sparse_score
+                scored[doc_id] = item
+
+    ranked = sorted(
+        scored.values(),
+        key=lambda x: x["weighted_score"],
+        reverse=True,
+    )
+
+    return ranked[:fetch_top_k]

@@ -152,7 +152,20 @@ class HNSWSearchConfig(BaseModel):
 class BM25SearchConfig(BaseModel):
     k: int = Field(20, description="Number of candidates to fetch")
     text_config: str = Field("public.korean", description="BM25 text configuration (e.g., 'public.korean', 'english')")
-    
+
+
+#### Fusion Config
+class RRFConfig(BaseModel):
+    """Reciprocal Rank Fusion configuration."""
+    k: int = Field(60, description="RRF constant. Higher = less impact from rank differences")
+    dense_weight: float = Field(1.0, description="Weight for dense results")
+    sparse_weight: float = Field(1.0, description="Weight for sparse results")
+
+class WSRConfig(BaseModel):
+    """Weighted Sum Ranking configuration."""
+    dense_weight: float = Field(0.7, description="Weight for dense results")
+    sparse_weight: float = Field(0.3, description="Weight for sparse results")
+
 
 class SearchConfig(BaseModel):
     """Hybrid search configuration."""
@@ -162,12 +175,20 @@ class SearchConfig(BaseModel):
 
     fusion_strategy: FusionStrategy = Field(FusionStrategy.RRF, description="")
 
-    hnsw: HNSWSearchConfig = Field(
-        default_factory=HNSWSearchConfig,
-        description="Dense HNSW search parameters",
+    hnsw: Optional[HNSWSearchConfig] = Field(
+        default=None,
+        description="Dense HNSW search parameters. Uses defaults if None.",
     )
-    bm25: BM25SearchConfig = Field(
-        default_factory=BM25SearchConfig,
-        description="Sparse BM25 search parameters",
+    bm25: Optional[BM25SearchConfig] = Field(
+        default=None,
+        description="Sparse BM25 search parameters. Uses defaults if None.",
     )
-    
+
+    rrf: Optional[RRFConfig] = Field(
+        default=None,
+        description="RRF fusion parameters. Only used when fusion_strategy=RRF. Uses defaults if None.",
+    )
+    wsr: Optional[WSRConfig] = Field(
+        default=None,
+        description="WSR fusion parameters. Only used when fusion_strategy=WSR. Uses defaults if None.",
+    )

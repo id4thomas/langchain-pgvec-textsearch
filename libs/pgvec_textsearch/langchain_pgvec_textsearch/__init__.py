@@ -17,12 +17,15 @@ from .vectorstores import (
     SearchConfig,
     HNSWSearchConfig,
     BM25SearchConfig,
+    RRFConfig,
+    WSRConfig,
     # Types
     DistanceStrategy,
     FusionStrategy,
     IterativeScanStrategy,
     # Search utils
     reciprocal_rank_fusion,
+    weighted_sum_ranking,
     # Filters
     FilterOperator,
     FilterCondition,
@@ -48,12 +51,15 @@ __all__ = [
     "SearchConfig",
     "HNSWSearchConfig",
     "BM25SearchConfig",
+    "RRFConfig",
+    "WSRConfig",
     # Types
     "DistanceStrategy",
     "FusionStrategy",
     "IterativeScanStrategy",
     # Search utils
     "reciprocal_rank_fusion",
+    "weighted_sum_ranking",
     # Filters
     "FilterOperator",
     "FilterCondition",

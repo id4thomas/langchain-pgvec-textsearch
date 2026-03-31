@@ -4,7 +4,7 @@ PGVecTextSearch VectorStore - Hybrid Search with pgvector and pg_textsearch.
 Combines:
 - Dense search: pgvector HNSW index
 - Sparse search: pg_textsearch BM25 index
-- Fusion: RRF (Reciprocal Rank Fusion)
+- Fusion: RRF (Reciprocal Rank Fusion) or WSR (Weighted Sum Ranking)
 """
 
 from __future__ import annotations
@@ -23,6 +23,10 @@ from sqlalchemy import RowMapping, text
 from .config import (
     SearchConfig,
     TableConfig,
+    HNSWSearchConfig,
+    BM25SearchConfig,
+    RRFConfig,
+    WSRConfig,
 )
 from .data import Row
 from .engine import AsyncPGVecTextSearchEngine
@@ -31,7 +35,8 @@ from .filters import (
     MetadataFilters,
     build_filter_clause,
 )
-from .search_utils import reciprocal_rank_fusion
+from .search_utils import reciprocal_rank_fusion, weighted_sum_ranking
+from .types import FusionStrategy
 
 
 class PGVecTextSearchStore(VectorStore):
@@ -176,6 +181,7 @@ class PGVecTextSearchStore(VectorStore):
 
         score = (
             row.get("rrf_score")
+            or row.get("weighted_score")
             or row.get("distance")
             or row.get("bm25_score", 0.0)
         )
@@ -321,19 +327,21 @@ class PGVecTextSearchStore(VectorStore):
         sparse_results: Sequence[RowMapping] = []
 
         if config.enable_dense:
+            hnsw = config.hnsw or HNSWSearchConfig()
             dense_results = await self.engine.query_hnsw(
                 self.table_config,
                 embedding,
-                self.search_config.hnsw,
+                hnsw,
                 filter_clause,
                 filter_params,
             )
 
         if config.enable_sparse:
+            bm25 = config.bm25 or BM25SearchConfig()
             sparse_results = await self.engine.query_bm25(
                 self.table_config,
                 query,
-                self.search_config.bm25,
+                bm25,
                 filter_clause=filter_clause,
                 filter_params=filter_params,
             )
@@ -344,13 +352,28 @@ class PGVecTextSearchStore(VectorStore):
         if not config.enable_dense:
             return [dict(row) for row in sparse_results[:k]]
 
-        # Fuse results
-        return reciprocal_rank_fusion(
-            dense_results,
-            sparse_results,
-            id_column=self.table_config.id_column,
-            fetch_top_k=k,
-        )
+        # Fuse results based on configured strategy
+        if config.fusion_strategy == FusionStrategy.WSR:
+            wsr = config.wsr or WSRConfig()
+            return weighted_sum_ranking(
+                dense_results,
+                sparse_results,
+                id_column=self.table_config.id_column,
+                fetch_top_k=k,
+                dense_weight=wsr.dense_weight,
+                sparse_weight=wsr.sparse_weight,
+            )
+        else:  # RRF (default)
+            rrf = config.rrf or RRFConfig()
+            return reciprocal_rank_fusion(
+                dense_results,
+                sparse_results,
+                id_column=self.table_config.id_column,
+                fetch_top_k=k,
+                rrf_k=rrf.k,
+                dense_weight=rrf.dense_weight,
+                sparse_weight=rrf.sparse_weight,
+            )
 
     async def asimilarity_search(
         self,
@@ -415,9 +438,8 @@ class PGVecTextSearchStore(VectorStore):
             )
         else:
             # Dense-only: override config k with requested k
-            config = self.search_config.hnsw.model_copy(
-                update={"k": final_k}
-            )
+            hnsw = self.search_config.hnsw or HNSWSearchConfig()
+            config = hnsw.model_copy(update={"k": final_k})
             results = await self.engine.query_hnsw(
                 self.table_config, embedding, config,
                 filter_clause, filter_params,
@@ -463,9 +485,8 @@ class PGVecTextSearchStore(VectorStore):
         filter_clause, filter_params = self._resolve_filter(filter)
 
         # Fetch more candidates for MMR
-        config = self.search_config.hnsw.model_copy(
-            update={"k": final_fetch_k}
-        )
+        hnsw = self.search_config.hnsw or HNSWSearchConfig()
+        config = hnsw.model_copy(update={"k": final_fetch_k})
         results = await self.engine.query_hnsw(
             self.table_config, embedding, config,
             filter_clause, filter_params,

@@ -10,9 +10,11 @@ from .config import (
     BM25IndexConfig,
     HNSWSearchConfig,
     BM25SearchConfig,
+    RRFConfig,
+    WSRConfig,
 )
 from .data import Row
-from .search_utils import reciprocal_rank_fusion
+from .search_utils import reciprocal_rank_fusion, weighted_sum_ranking
 from .filters import (
     FilterOperator,
     FilterCondition,
@@ -45,12 +47,15 @@ __all__ = [
     "SearchConfig",
     "HNSWSearchConfig",
     "BM25SearchConfig",
+    "RRFConfig",
+    "WSRConfig",
     # Types
     "DistanceStrategy",
     "FusionStrategy",
     "IterativeScanStrategy",
     # Search utils
     "reciprocal_rank_fusion",
+    "weighted_sum_ranking",
     # Filters
     "FilterOperator",
     "FilterCondition",
