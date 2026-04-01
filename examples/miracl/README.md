@@ -3,7 +3,8 @@
 Multilingual retrieval evaluation using the MIRACL dataset.
 
 ## Perf
-### Korean
+### Qwen3-Embedding-0.6B
+**[korean]**
 ```
 --- Results @ k=5 ---
                           Recall@5  Precision@5  nDCG@5    MRR    MAP

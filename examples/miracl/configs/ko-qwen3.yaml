@@ -1,0 +1,24 @@
+# miracl / Korean / Qwen3-Embedding
+dataset:
+  data_name: miracl
+  table_name: miracl-ko-documents
+  lang: ko
+  text_config: public.korean
+  max_length: 8000
+  max_docs: null
+
+embedding:
+  model: Qwen3-Embedding-0.6B
+  base_url: "http://localhost:910/v1"
+  api_key: sk-abc
+  dim: 1024
+
+index:
+  hnsw:
+    m: 32
+    ef_construction: 128
+    distance_strategy: COSINE_DISTANCE
+  bm25:
+    text_config: public.korean
+  batch_size: 64
+  concurrency: 32

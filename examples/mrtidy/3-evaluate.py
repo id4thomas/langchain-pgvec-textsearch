@@ -1,87 +1,65 @@
 # %%
 """
-Retrieval Evaluation Script for MIRACL Dataset (Korean)
-
-Uses:
-- Korean queries from topics TSV files
-- Korean corpus with public.korean text search config
-- BM25 index configured with public.korean
+Retrieval Evaluation Script for mrtidy Dataset
 
 Metrics:
 - Recall@k, Precision@k, nDCG@k, MRR, MAP
+
+Usage:
+    python 3-evaluate.py --config configs/ko-qwen3.yaml --eval-config configs/evaluate.yaml
+    python 3-evaluate.py --config configs/en-qwen3.yaml --eval-config configs/evaluate.yaml
 """
+import argparse
 import asyncio
 import numpy as np
 from collections import defaultdict
 from dataclasses import dataclass
+from datasets import load_from_disk
 from pathlib import Path
 from langchain_openai import OpenAIEmbeddings
 from langchain_pgvec_textsearch import (
     PGVecTextSearchStore,
-    PGVecTextSearchEngine,
-    HybridSearchConfig,
-    reciprocal_rank_fusion,
+    AsyncPGVecTextSearchEngine,
+    TableConfig,
+    SearchConfig,
 )
 from tqdm.asyncio import tqdm as atqdm
 import pandas as pd
 
-from config import settings
-
-DATA_NAME = "miracl"
-LANG = "ko"
-TABLE_NAME = f"{DATA_NAME}-{LANG}-documents"
-TEXT_CONFIG = "public.korean"
-
-# %%
-DATABASE_URL = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
-    settings.postgres_user,
-    settings.postgres_password,
-    settings.postgres_ip,
-    settings.postgres_port,
-    settings.postgres_db,
+from config import (
+    settings,
+    load_experiment_config,
+    build_search_configs,
 )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate retrieval on mrtidy")
+    parser.add_argument("--config", type=str, required=True, help="Path to index YAML config (model/lang specific)")
+    parser.add_argument("--eval-config", type=str, default="configs/evaluate.yaml", help="Path to evaluate YAML config (default: configs/evaluate.yaml)")
+    return parser.parse_args()
 
 
 # %% [markdown]
 # # Data Loading Functions
 
 # %%
-def load_topics(filepath: str) -> dict[str, str]:
-    """Load topics (queries) from TSV file."""
-    queries = {}
-    with open(filepath, encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) >= 2:
-                qid, query = parts[0], parts[1]
-                queries[qid] = query
-    return queries
-
-
-def load_qrels(filepath: str) -> dict[str, set[str]]:
-    """Load qrels (relevance judgments) from TSV file.
-    Only includes positive relevance (rel=1).
-    """
-    qrels = defaultdict(set)
-    with open(filepath, encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) >= 4:
-                qid, _, docid, rel = parts[0], parts[1], parts[2], int(parts[3])
-                if rel == 1:  # Only positive relevance
-                    qrels[qid].add(docid)
-    return dict(qrels)
+_LANG_FULL = {"en": "english", "ko": "korean"}
 
 
 def load_evaluation_data(data_dir: str, lang: str, split: str = "dev"):
-    """Load topics and qrels for evaluation."""
-    base_path = Path(data_dir) / f"miracl-v1.0-{lang}"
+    lang_full = _LANG_FULL.get(lang, lang)
+    base_path = Path(data_dir)
 
-    topics_file = base_path / "topics" / f"topics.miracl-v1.0-{lang}-{split}.tsv"
-    qrels_file = base_path / "qrels" / f"qrels.miracl-v1.0-{lang}-{split}.tsv"
+    queries_ds = load_from_disk(str(base_path / f"{lang_full}-queries"))[split]
+    queries_dict = {row["_id"]: row["text"] for row in queries_ds}
 
-    queries_dict = load_topics(str(topics_file))
-    qrels_dict = load_qrels(str(qrels_file))
+    qrels_ds = load_from_disk(str(base_path / f"{lang_full}-qrels"))[split]
+    qrels_dict = defaultdict(set)
+    for row in qrels_ds:
+        if row["score"] >= 1:
+            qrels_dict[row["query-id"]].add(row["corpus-id"])
+    qrels_dict = dict(qrels_dict)
 
     return qrels_dict, queries_dict
 
@@ -92,7 +70,6 @@ def load_evaluation_data(data_dir: str, lang: str, split: str = "dev"):
 # %%
 @dataclass
 class RetrievalMetrics:
-    """Container for retrieval evaluation metrics."""
     recall: float
     precision: float
     ndcg: float
@@ -101,136 +78,51 @@ class RetrievalMetrics:
 
 
 def compute_dcg(relevances: list[float], k: int) -> float:
-    """Compute Discounted Cumulative Gain at k."""
     relevances = relevances[:k]
     if not relevances:
         return 0.0
-    dcg = sum(rel / np.log2(i + 2) for i, rel in enumerate(relevances))
-    return dcg
+    return sum(rel / np.log2(i + 2) for i, rel in enumerate(relevances))
 
 
 def compute_ndcg(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
-    """Compute Normalized DCG at k."""
     relevances = [1.0 if doc_id in relevant_ids else 0.0 for doc_id in retrieved_ids[:k]]
     dcg = compute_dcg(relevances, k)
-
     num_relevant = min(len(relevant_ids), k)
     ideal_relevances = [1.0] * num_relevant + [0.0] * (k - num_relevant)
     idcg = compute_dcg(ideal_relevances, k)
-
     if idcg == 0:
         return 0.0
     return dcg / idcg
 
 
 def compute_average_precision(retrieved_ids: list[str], relevant_ids: set[str]) -> float:
-    """Compute Average Precision for a single query."""
     if not relevant_ids:
         return 0.0
-
     num_relevant_seen = 0
     precision_sum = 0.0
-
     for i, doc_id in enumerate(retrieved_ids):
         if doc_id in relevant_ids:
             num_relevant_seen += 1
-            precision_at_i = num_relevant_seen / (i + 1)
-            precision_sum += precision_at_i
-
+            precision_sum += num_relevant_seen / (i + 1)
     if num_relevant_seen == 0:
         return 0.0
-
     return precision_sum / len(relevant_ids)
 
 
-def compute_metrics(
-    retrieved_ids: list[str],
-    relevant_ids: set[str],
-    k: int
-) -> RetrievalMetrics:
-    """Compute all retrieval metrics for a single query."""
+def compute_metrics(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> RetrievalMetrics:
     retrieved_at_k = retrieved_ids[:k]
     retrieved_set = set(retrieved_at_k)
-
     tp = len(retrieved_set & relevant_ids)
     recall = tp / len(relevant_ids) if relevant_ids else 0.0
     precision = tp / k if k > 0 else 0.0
     ndcg = compute_ndcg(retrieved_ids, relevant_ids, k)
-
     mrr = 0.0
     for i, doc_id in enumerate(retrieved_ids):
         if doc_id in relevant_ids:
             mrr = 1.0 / (i + 1)
             break
-
     ap = compute_average_precision(retrieved_ids, relevant_ids)
-
-    return RetrievalMetrics(
-        recall=recall,
-        precision=precision,
-        ndcg=ndcg,
-        mrr=mrr,
-        ap=ap,
-    )
-
-
-# %% [markdown]
-# # Search Configurations
-
-# %%
-def get_search_configs() -> dict[str, HybridSearchConfig]:
-    """Define search configurations for evaluation."""
-    return {
-        "dense": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=False,
-            ef_search=128,
-        ),
-        "sparse (BM25 korean)": HybridSearchConfig(
-            enable_dense=False,
-            enable_sparse=True,
-        ),
-        "hybrid (RRF k=60)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=60, d=0.7)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            dense_weight=0.7,
-            sparse_weight=0.3,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=30, d=0.7)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            dense_weight=0.7,
-            sparse_weight=0.3,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 30},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=20)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 20},
-            ef_search=128,
-        ),
-    }
+    return RetrievalMetrics(recall=recall, precision=precision, ndcg=ndcg, mrr=mrr, ap=ap)
 
 
 # %% [markdown]
@@ -238,25 +130,24 @@ def get_search_configs() -> dict[str, HybridSearchConfig]:
 
 # %%
 async def evaluate_config(
-    engine: PGVecTextSearchEngine,
+    engine: AsyncPGVecTextSearchEngine,
     embedding_service,
+    table_config: TableConfig,
     config_name: str,
-    config: HybridSearchConfig,
+    config: SearchConfig,
     qrels_dict: dict[str, set[str]],
     queries_dict: dict[str, str],
     k_values: list[int],
 ) -> dict[str, dict[str, float]]:
-    """Evaluate a search configuration across all queries."""
     store = await PGVecTextSearchStore.create(
         engine=engine,
         embedding_service=embedding_service,
-        table_name=TABLE_NAME,
-        hybrid_search_config=config,
+        table_config=table_config,
+        search_config=config,
     )
 
     results_by_k = {k: defaultdict(list) for k in k_values}
     max_k = max(k_values)
-
     valid_query_ids = [qid for qid in qrels_dict.keys() if qid in queries_dict]
 
     print(f"\nEvaluating {config_name} ({len(valid_query_ids)} queries)...")
@@ -264,7 +155,6 @@ async def evaluate_config(
     for query_id in atqdm(valid_query_ids, desc=config_name):
         query_text = f"Query: {queries_dict[query_id]}"
         relevant_ids = qrels_dict[query_id]
-
         results = await store.asimilarity_search_with_score(query_text, k=max_k)
         retrieved_ids = [doc.metadata.get("docid") for doc, _ in results]
 
@@ -285,7 +175,6 @@ async def evaluate_config(
             "MRR": np.mean(results_by_k[k]["mrr"]),
             "MAP": np.mean(results_by_k[k]["ap"]),
         }
-
     return aggregated
 
 
@@ -293,34 +182,61 @@ async def evaluate_config(
 # # Main Evaluation
 
 # %%
-async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
-    """Run Korean evaluation."""
-    engine = PGVecTextSearchEngine.from_connection_string_async(DATABASE_URL)
+async def main(index_cfg: dict, eval_cfg: dict):
+    ds = index_cfg["dataset"]
+    emb = index_cfg.get("embedding", {})
 
-    print(f"=== MIRACL Korean Evaluation (text_config: {TEXT_CONFIG}) ===")
-    print(f"Table: {TABLE_NAME}")
-    print(f"Split: {split}")
-    print(f"EMBEDDING: {settings.embedding_model}")
+    table_name = ds["table_name"]
+    lang = ds["lang"]
+    text_config = ds["text_config"]
+    k_values = eval_cfg.get("k_values", [5, 10, 20])
+    split = eval_cfg.get("split", "dev")
+
+    database_url = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
+        settings.postgres_user,
+        settings.postgres_password,
+        settings.postgres_ip,
+        settings.postgres_port,
+        settings.postgres_db,
+    )
+
+    engine = AsyncPGVecTextSearchEngine.from_connection_string(database_url)
+
+    embedding_dim = emb.get("dim", settings.embedding_dim)
+    table_config = TableConfig(
+        table_name=table_name,
+        vector_size=embedding_dim,
+    )
+
+    embedding_model = emb.get("model", settings.embedding_model)
+    embedding_base_url = emb.get("base_url", settings.embedding_base_url)
+    embedding_api_key = emb.get("api_key", settings.embedding_api_key)
+
+    print(f"=== mrtidy Evaluation (text_config: {text_config}) ===")
+    print(f"Table: {table_name}")
+    print(f"Language: {lang}")
+    print(f"EMBEDDING: {embedding_model}")
 
     embedding_service = OpenAIEmbeddings(
-        model=settings.embedding_model,
-        base_url=settings.embedding_base_url,
-        api_key=settings.embedding_api_key,
-        dimensions=settings.embedding_dim,
-        check_embedding_ctx_length=False
+        model=embedding_model,
+        base_url=embedding_base_url,
+        api_key=embedding_api_key,
+        dimensions=embedding_dim,
+        check_embedding_ctx_length=False,
     )
 
     print(f"\nLoading evaluation data from {settings.data_dir} (split: {split})...")
-    qrels_dict, queries_dict = load_evaluation_data(settings.data_dir, LANG, split)
+    qrels_dict, queries_dict = load_evaluation_data(settings.data_dir, lang, split)
     print(f"Loaded {len(queries_dict)} queries, {len(qrels_dict)} with relevance judgments")
 
-    configs = get_search_configs()
+    configs = build_search_configs(index_cfg, eval_cfg)
 
     all_results = {}
     for config_name, config in configs.items():
         results = await evaluate_config(
             engine=engine,
             embedding_service=embedding_service,
+            table_config=table_config,
             config_name=config_name,
             config=config,
             qrels_dict=qrels_dict,
@@ -329,13 +245,13 @@ async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
         )
         all_results[config_name] = results
 
-    return all_results
+    await engine.close()
+    return all_results, k_values
 
 
 def print_results(all_results: dict, k_values: list[int]):
-    """Print results in formatted tables."""
     print(f"\n{'='*70}")
-    print(f"MIRACL Korean EVALUATION RESULTS")
+    print(f"EVALUATION RESULTS")
     print(f"{'='*70}")
 
     for k in k_values:
@@ -345,12 +261,10 @@ def print_results(all_results: dict, k_values: list[int]):
             row = {"Config": config_name}
             row.update(results[k])
             rows.append(row)
-
         df = pd.DataFrame(rows)
         df = df.set_index("Config")
         print(df.to_string(float_format=lambda x: f"{x:.4f}"))
 
-    # Summary table
     print(f"\n{'='*70}")
     print("Summary Table")
     print(f"{'='*70}")
@@ -368,19 +282,21 @@ def print_results(all_results: dict, k_values: list[int]):
     summary_df = pd.DataFrame(summary_rows)
     summary_df = summary_df.set_index("Config")
     print(summary_df.to_string(float_format=lambda x: f"{x:.4f}"))
-
     return summary_df
 
 
 # %%
 if __name__ == "__main__":
-    K_VALUES = [5, 10, 20]
-    SPLIT = "dev"
+    args = parse_args()
+    index_cfg = load_experiment_config(args.config)
+    eval_cfg = load_experiment_config(args.eval_config)
 
-    results = asyncio.run(main(k_values=K_VALUES, split=SPLIT))
-    print_results(results, K_VALUES)
+    all_results, k_values = asyncio.run(main(index_cfg, eval_cfg))
+    print_results(all_results, k_values)
 
 # %%
 # For Jupyter notebook:
-# results = await main(k_values=[5, 10, 20], split="dev")
-# summary_df = print_results(results, [5, 10, 20])
+# index_cfg = load_experiment_config("configs/ko-qwen3.yaml")
+# eval_cfg = load_experiment_config("configs/evaluate.yaml")
+# all_results, k_values = await main(index_cfg, eval_cfg)
+# summary_df = print_results(all_results, k_values)

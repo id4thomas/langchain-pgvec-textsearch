@@ -1,0 +1,70 @@
+# Shared evaluation configuration for MIRACL
+k_values: [5, 10, 20]
+split: dev
+
+search_configs:
+  dense:
+    enable_dense: true
+    enable_sparse: false
+    hnsw:
+      k: 20
+      ef_search: 40
+    bm25:
+      k: 20
+
+  sparse_bm25:
+    enable_dense: false
+    enable_sparse: true
+    hnsw:
+      k: 20
+      ef_search: 40
+    bm25:
+      k: 20
+
+  hybrid_rrf_k60:
+    enable_dense: true
+    enable_sparse: true
+    hnsw:
+      k: 20
+      ef_search: 40
+    bm25:
+      k: 20
+    rrf:
+      k: 60
+
+  hybrid_rrf_k60_d0.7:
+    enable_dense: true
+    enable_sparse: true
+    hnsw:
+      k: 20
+      ef_search: 40
+    bm25:
+      k: 20
+    rrf:
+      k: 60
+    wsr:
+      dense_weight: 0.7
+
+  hybrid_rrf_k30_d0.7:
+    enable_dense: true
+    enable_sparse: true
+    hnsw:
+      k: 20
+      ef_search: 40
+    bm25:
+      k: 20
+    rrf:
+      k: 30
+    wsr:
+      dense_weight: 0.7
+
+  hybrid_rrf_k20:
+    enable_dense: true
+    enable_sparse: true
+    hnsw:
+      k: 20
+      ef_search: 40
+    bm25:
+      k: 20
+    rrf:
+      k: 20
