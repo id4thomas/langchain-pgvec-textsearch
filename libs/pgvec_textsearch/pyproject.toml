@@ -1,6 +1,6 @@
 [project]
 name = "langchain-pgvec-textsearch"
-version = "0.1.4"
+version = "1.0.0rc0"
 description = "LangChain VectorStore for hybrid search with pgvector (dense) and pg_textsearch (BM25)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -34,7 +34,6 @@ requires-python = ">=3.9"
 dependencies = [
     "asyncpg>=0.29.0",
     "langchain-core>=0.3.0",
-    "langchain-postgres>=0.0.16",
     "numpy>=1.24.0",
     "pgvector>=0.3.0",
     "sqlalchemy>=2.0.0",
@@ -64,6 +63,9 @@ typing = [
 test-integration = [
     { include-group = "test" },
     "langchain-openai>=0.1.0",
+]
+dev = [
+    "ruff>=0.14.14",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -1,0 +1,68 @@
+k_values: [5, 10, 20]
+split: test
+
+search_configs:
+  dense:
+    enable_dense: true
+    enable_sparse: false
+    hnsw:
+      ef_search: 128
+      distance_strategy: COSINE_DISTANCE
+
+  sparse (BM25):
+    enable_dense: false
+    enable_sparse: true
+    hnsw:
+      distance_strategy: COSINE_DISTANCE
+
+  "hybrid (RRF k=60)":
+    enable_dense: true
+    enable_sparse: true
+    rrf:
+      k: 60
+    hnsw:
+      k: 100
+      ef_search: 128
+      distance_strategy: COSINE_DISTANCE
+    bm25:
+      k: 100
+
+  "hybrid (RRF k=60, d=0.7)":
+    enable_dense: true
+    enable_sparse: true
+    rrf:
+      k: 60
+      dense_weight: 0.7
+      sparse_weight: 0.3
+    hnsw:
+      k: 100
+      ef_search: 128
+      distance_strategy: COSINE_DISTANCE
+    bm25:
+      k: 100
+
+  "hybrid (RRF k=30, d=0.7)":
+    enable_dense: true
+    enable_sparse: true
+    rrf:
+      k: 30
+      dense_weight: 0.7
+      sparse_weight: 0.3
+    hnsw:
+      k: 100
+      ef_search: 128
+      distance_strategy: COSINE_DISTANCE
+    bm25:
+      k: 100
+
+  "hybrid (RRF k=20)":
+    enable_dense: true
+    enable_sparse: true
+    rrf:
+      k: 20
+    hnsw:
+      k: 100
+      ef_search: 128
+      distance_strategy: COSINE_DISTANCE
+    bm25:
+      k: 100

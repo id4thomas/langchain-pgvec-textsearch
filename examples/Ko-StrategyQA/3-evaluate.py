@@ -1,15 +1,15 @@
 # %%
 """
-Retrieval Evaluation Script for Ko-StrategyQA Dataset (Korean)
-
-Uses:
-- Korean queries (ko split)
-- Korean corpus with public.korean text search config
-- BM25 index configured with public.korean
+Retrieval Evaluation Script for Ko-StrategyQA Dataset
 
 Metrics:
 - Recall@k, Precision@k, nDCG@k, MRR, MAP
+
+Usage:
+    python 3-evaluate.py --index-config configs/ko-qwen3.yaml --eval-config configs/evaluate.yaml
+    python 3-evaluate.py --index-config configs/en-qwen3.yaml --eval-config configs/evaluate.yaml
 """
+import argparse
 import asyncio
 import numpy as np
 from collections import defaultdict
@@ -18,28 +18,25 @@ from datasets import load_dataset
 from langchain_openai import OpenAIEmbeddings
 from langchain_pgvec_textsearch import (
     PGVecTextSearchStore,
-    PGVecTextSearchEngine,
-    HybridSearchConfig,
-    reciprocal_rank_fusion,
+    AsyncPGVecTextSearchEngine,
+    TableConfig,
+    SearchConfig,
 )
 from tqdm.asyncio import tqdm as atqdm
 import pandas as pd
 
-from config import settings
-
-DATA_NAME = "KoStrategyQA"
-TABLE_NAME = f"{DATA_NAME}-documents"  # Table with Korean corpus and public.korean BM25 index
-QUERY_LANG = "ko"  # Korean queries
-TEXT_CONFIG = "public.korean"  # Korean text search configuration
-
-# %%
-DATABASE_URL = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
-    settings.postgres_user,
-    settings.postgres_password,
-    settings.postgres_ip,
-    settings.postgres_port,
-    settings.postgres_db,
+from config import (
+    settings,
+    load_experiment_config,
+    build_search_configs,
 )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate retrieval on Ko-StrategyQA")
+    parser.add_argument("--index-config", type=str, required=True, help="Path to index YAML config (model/lang specific)")
+    parser.add_argument("--eval-config", type=str, default="configs/evaluate.yaml", help="Path to evaluate YAML config (default: configs/evaluate.yaml)")
+    return parser.parse_args()
 
 
 # %% [markdown]
@@ -136,84 +133,19 @@ def compute_metrics(
 # %%
 def load_evaluation_data(data_dir: str, split: str = "dev", query_lang: str = "ko"):
     """Load qrels and queries for evaluation."""
-    # Load qrels (ground truth)
     qrels_ds = load_dataset(data_dir, "default")
     qrels = qrels_ds[split]
 
-    # Load queries (Korean)
     queries_ds = load_dataset(data_dir, "queries")
     queries = queries_ds[query_lang]
 
-    # Build query_id -> relevant corpus_ids mapping
     qrels_dict = defaultdict(set)
     for item in qrels:
-        query_id = item["query-id"]
-        corpus_id = item["corpus-id"]
-        qrels_dict[query_id].add(corpus_id)
+        qrels_dict[item["query-id"]].add(item["corpus-id"])
 
-    # Build query_id -> query_text mapping
     queries_dict = {q["_id"]: q["text"] for q in queries}
 
     return qrels_dict, queries_dict
-
-
-# %% [markdown]
-# # Search Configurations
-
-# %%
-def get_search_configs() -> dict[str, HybridSearchConfig]:
-    """Define search configurations for Korean evaluation."""
-    return {
-        "dense": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=False,
-            ef_search=128,
-        ),
-        "sparse (BM25 korean)": HybridSearchConfig(
-            enable_dense=False,
-            enable_sparse=True,
-        ),
-        "hybrid (RRF k=60)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=60, d=0.7)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            dense_weight=0.7,
-            sparse_weight=0.3,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 60},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=30, d=0.7)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            dense_weight=0.7,
-            sparse_weight=0.3,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 30},
-            ef_search=128,
-        ),
-        "hybrid (RRF k=20)": HybridSearchConfig(
-            enable_dense=True,
-            enable_sparse=True,
-            dense_top_k=100,
-            sparse_top_k=100,
-            fusion_function=reciprocal_rank_fusion,
-            fusion_function_parameters={"rrf_k": 20},
-            ef_search=128,
-        ),
-    }
 
 
 # %% [markdown]
@@ -221,10 +153,11 @@ def get_search_configs() -> dict[str, HybridSearchConfig]:
 
 # %%
 async def evaluate_config(
-    engine: PGVecTextSearchEngine,
+    engine: AsyncPGVecTextSearchEngine,
     embedding_service,
+    table_config: TableConfig,
     config_name: str,
-    config: HybridSearchConfig,
+    config: SearchConfig,
     qrels_dict: dict[str, set[str]],
     queries_dict: dict[str, str],
     k_values: list[int],
@@ -233,8 +166,8 @@ async def evaluate_config(
     store = await PGVecTextSearchStore.create(
         engine=engine,
         embedding_service=embedding_service,
-        table_name=TABLE_NAME,
-        hybrid_search_config=config,
+        table_config=table_config,
+        search_config=config,
     )
 
     results_by_k = {k: defaultdict(list) for k in k_values}
@@ -276,36 +209,64 @@ async def evaluate_config(
 # # Main Evaluation
 
 # %%
-async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
-    """Run Korean evaluation."""
-    engine = PGVecTextSearchEngine.from_connection_string_async(DATABASE_URL)
+async def main(index_cfg: dict, eval_cfg: dict):
+    """Run evaluation."""
+    ds = index_cfg["dataset"]
+    emb = index_cfg.get("embedding", {})
 
-    print(f"=== Korean Evaluation (text_config: {TEXT_CONFIG}) ===")
-    print(f"Table: {TABLE_NAME}")
-    print(f"Query language: {QUERY_LANG}")
-    print(f"EMBEDDING: {settings.embedding_model}")
+    table_name = ds.get("table_name", f"{ds['data_name']}-documents")
+    query_lang = ds["query_lang"]
+    text_config = ds["text_config"]
+    k_values = eval_cfg.get("k_values", [5, 10, 20])
+    split = eval_cfg.get("split", "dev")
+
+    database_url = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
+        settings.postgres_user,
+        settings.postgres_password,
+        settings.postgres_ip,
+        settings.postgres_port,
+        settings.postgres_db,
+    )
+
+    engine = AsyncPGVecTextSearchEngine.from_connection_string(database_url)
+
+    embedding_dim = emb.get("dim", settings.embedding_dim)
+    table_config = TableConfig(
+        table_name=table_name,
+        vector_size=embedding_dim,
+    )
+
+    embedding_model = emb.get("model", settings.embedding_model)
+    embedding_base_url = emb.get("base_url", settings.embedding_base_url)
+    embedding_api_key = emb.get("api_key", settings.embedding_api_key)
+
+    print(f"=== Evaluation (text_config: {text_config}) ===")
+    print(f"Table: {table_name}")
+    print(f"Query language: {query_lang}")
+    print(f"EMBEDDING: {embedding_model}")
 
     embedding_service = OpenAIEmbeddings(
-        model=settings.embedding_model,
-        base_url=settings.embedding_base_url,
-        api_key=settings.embedding_api_key,
-        dimensions=settings.embedding_dim,
-        check_embedding_ctx_length=False
+        model=embedding_model,
+        base_url=embedding_base_url,
+        api_key=embedding_api_key,
+        dimensions=embedding_dim,
+        check_embedding_ctx_length=False,
     )
 
     print(f"\nLoading evaluation data from {settings.data_dir} (split: {split})...")
     qrels_dict, queries_dict = load_evaluation_data(
-        settings.data_dir, split, query_lang=QUERY_LANG
+        settings.data_dir, split, query_lang=query_lang
     )
     print(f"Loaded {len(qrels_dict)} queries with relevance judgments")
 
-    configs = get_search_configs()
+    configs = build_search_configs(index_cfg, eval_cfg)
 
     all_results = {}
     for config_name, config in configs.items():
         results = await evaluate_config(
             engine=engine,
             embedding_service=embedding_service,
+            table_config=table_config,
             config_name=config_name,
             config=config,
             qrels_dict=qrels_dict,
@@ -314,13 +275,14 @@ async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
         )
         all_results[config_name] = results
 
-    return all_results
+    await engine.close()
+    return all_results, k_values
 
 
 def print_results(all_results: dict, k_values: list[int]):
     """Print results in formatted tables."""
     print(f"\n{'='*70}")
-    print(f"KOREAN EVALUATION RESULTS")
+    print(f"EVALUATION RESULTS")
     print(f"{'='*70}")
 
     for k in k_values:
@@ -359,13 +321,16 @@ def print_results(all_results: dict, k_values: list[int]):
 
 # %%
 if __name__ == "__main__":
-    K_VALUES = [5, 10, 20]
-    SPLIT = "dev"
+    args = parse_args()
+    index_cfg = load_experiment_config(args.index_config)
+    eval_cfg = load_experiment_config(args.eval_config)
 
-    results = asyncio.run(main(k_values=K_VALUES, split=SPLIT))
-    print_results(results, K_VALUES)
+    all_results, k_values = asyncio.run(main(index_cfg, eval_cfg))
+    print_results(all_results, k_values)
 
 # %%
 # For Jupyter notebook:
-# results = await main(k_values=[5, 10, 20], split="dev")
-# summary_df = print_results(results, [5, 10, 20])
+# index_cfg = load_experiment_config("configs/ko-qwen3.yaml")
+# eval_cfg = load_experiment_config("configs/evaluate.yaml")
+# all_results, k_values = await main(index_cfg, eval_cfg)
+# summary_df = print_results(all_results, k_values)

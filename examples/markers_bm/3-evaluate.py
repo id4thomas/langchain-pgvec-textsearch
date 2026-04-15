@@ -1,125 +1,41 @@
 # %%
 """
-Retrieval Evaluation Script for Ko-StrategyQA Dataset (Korean) - pgvector dense only
-
-Uses langchain-postgres official package for comparison.
-Dense vector search only (no BM25/hybrid).
+Retrieval Evaluation Script for markers_bm Dataset
 
 Metrics:
 - Recall@k, Precision@k, nDCG@k, MRR, MAP
+
+Usage:
+    python 3-evaluate.py --config configs/ko-qwen3.yaml --eval-config configs/evaluate.yaml
 """
+import argparse
 import asyncio
 import numpy as np
 from collections import defaultdict
 from dataclasses import dataclass
 from datasets import load_dataset
 from langchain_openai import OpenAIEmbeddings
-from langchain_postgres import PGEngine, PGVectorStore
+from langchain_pgvec_textsearch import (
+    PGVecTextSearchStore,
+    AsyncPGVecTextSearchEngine,
+    TableConfig,
+    SearchConfig,
+)
 from tqdm.asyncio import tqdm as atqdm
 import pandas as pd
 
-from config import settings
-
-DATA_NAME = "KoStrategyQA"
-TABLE_NAME = f"{DATA_NAME}-pgvec-documents"
-QUERY_LANG = "ko"
-
-# %%
-DATABASE_URL = "postgresql+psycopg://{}:{}@{}:{}/{}".format(
-    settings.postgres_user,
-    settings.postgres_password,
-    settings.postgres_ip,
-    settings.postgres_port,
-    settings.postgres_db,
+from config import (
+    settings,
+    load_experiment_config,
+    build_search_configs,
 )
 
 
-# %% [markdown]
-# # Evaluation Metrics
-
-# %%
-@dataclass
-class RetrievalMetrics:
-    """Container for retrieval evaluation metrics."""
-    recall: float
-    precision: float
-    ndcg: float
-    mrr: float
-    ap: float
-
-
-def compute_dcg(relevances: list[float], k: int) -> float:
-    """Compute Discounted Cumulative Gain at k."""
-    relevances = relevances[:k]
-    if not relevances:
-        return 0.0
-    dcg = sum(rel / np.log2(i + 2) for i, rel in enumerate(relevances))
-    return dcg
-
-
-def compute_ndcg(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
-    """Compute Normalized DCG at k."""
-    relevances = [1.0 if doc_id in relevant_ids else 0.0 for doc_id in retrieved_ids[:k]]
-    dcg = compute_dcg(relevances, k)
-
-    num_relevant = min(len(relevant_ids), k)
-    ideal_relevances = [1.0] * num_relevant + [0.0] * (k - num_relevant)
-    idcg = compute_dcg(ideal_relevances, k)
-
-    if idcg == 0:
-        return 0.0
-    return dcg / idcg
-
-
-def compute_average_precision(retrieved_ids: list[str], relevant_ids: set[str]) -> float:
-    """Compute Average Precision for a single query."""
-    if not relevant_ids:
-        return 0.0
-
-    num_relevant_seen = 0
-    precision_sum = 0.0
-
-    for i, doc_id in enumerate(retrieved_ids):
-        if doc_id in relevant_ids:
-            num_relevant_seen += 1
-            precision_at_i = num_relevant_seen / (i + 1)
-            precision_sum += precision_at_i
-
-    if num_relevant_seen == 0:
-        return 0.0
-
-    return precision_sum / len(relevant_ids)
-
-
-def compute_metrics(
-    retrieved_ids: list[str],
-    relevant_ids: set[str],
-    k: int
-) -> RetrievalMetrics:
-    """Compute all retrieval metrics for a single query."""
-    retrieved_at_k = retrieved_ids[:k]
-    retrieved_set = set(retrieved_at_k)
-
-    tp = len(retrieved_set & relevant_ids)
-    recall = tp / len(relevant_ids) if relevant_ids else 0.0
-    precision = tp / k if k > 0 else 0.0
-    ndcg = compute_ndcg(retrieved_ids, relevant_ids, k)
-
-    mrr = 0.0
-    for i, doc_id in enumerate(retrieved_ids):
-        if doc_id in relevant_ids:
-            mrr = 1.0 / (i + 1)
-            break
-
-    ap = compute_average_precision(retrieved_ids, relevant_ids)
-
-    return RetrievalMetrics(
-        recall=recall,
-        precision=precision,
-        ndcg=ndcg,
-        mrr=mrr,
-        ap=ap,
-    )
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate retrieval on markers_bm")
+    parser.add_argument("--index-config", type=str, required=True, help="Path to index YAML config (model/lang specific)")
+    parser.add_argument("--eval-config", type=str, default="configs/evaluate.yaml", help="Path to evaluate YAML config (default: configs/evaluate.yaml)")
+    return parser.parse_args()
 
 
 # %% [markdown]
@@ -134,7 +50,7 @@ def load_evaluation_data(data_dir: str, split: str = "dev", query_lang: str = "k
 
     # Load queries (Korean)
     queries_ds = load_dataset(data_dir, "queries")
-    queries = queries_ds[query_lang]
+    queries = queries_ds["queries"]
 
     # Build query_id -> relevant corpus_ids mapping
     qrels_dict = defaultdict(set)
@@ -148,36 +64,97 @@ def load_evaluation_data(data_dir: str, split: str = "dev", query_lang: str = "k
 
     return qrels_dict, queries_dict
 
+# %% [markdown]
+# # Evaluation Metrics
+
+# %%
+@dataclass
+class RetrievalMetrics:
+    recall: float
+    precision: float
+    ndcg: float
+    mrr: float
+    ap: float
+
+
+def compute_dcg(relevances: list[float], k: int) -> float:
+    relevances = relevances[:k]
+    if not relevances:
+        return 0.0
+    return sum(rel / np.log2(i + 2) for i, rel in enumerate(relevances))
+
+
+def compute_ndcg(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> float:
+    relevances = [1.0 if doc_id in relevant_ids else 0.0 for doc_id in retrieved_ids[:k]]
+    dcg = compute_dcg(relevances, k)
+    num_relevant = min(len(relevant_ids), k)
+    ideal_relevances = [1.0] * num_relevant + [0.0] * (k - num_relevant)
+    idcg = compute_dcg(ideal_relevances, k)
+    if idcg == 0:
+        return 0.0
+    return dcg / idcg
+
+
+def compute_average_precision(retrieved_ids: list[str], relevant_ids: set[str]) -> float:
+    if not relevant_ids:
+        return 0.0
+    num_relevant_seen = 0
+    precision_sum = 0.0
+    for i, doc_id in enumerate(retrieved_ids):
+        if doc_id in relevant_ids:
+            num_relevant_seen += 1
+            precision_sum += num_relevant_seen / (i + 1)
+    if num_relevant_seen == 0:
+        return 0.0
+    return precision_sum / len(relevant_ids)
+
+
+def compute_metrics(retrieved_ids: list[str], relevant_ids: set[str], k: int) -> RetrievalMetrics:
+    retrieved_at_k = retrieved_ids[:k]
+    retrieved_set = set(retrieved_at_k)
+    tp = len(retrieved_set & relevant_ids)
+    recall = tp / len(relevant_ids) if relevant_ids else 0.0
+    precision = tp / k if k > 0 else 0.0
+    ndcg = compute_ndcg(retrieved_ids, relevant_ids, k)
+    mrr = 0.0
+    for i, doc_id in enumerate(retrieved_ids):
+        if doc_id in relevant_ids:
+            mrr = 1.0 / (i + 1)
+            break
+    ap = compute_average_precision(retrieved_ids, relevant_ids)
+    return RetrievalMetrics(recall=recall, precision=precision, ndcg=ndcg, mrr=mrr, ap=ap)
+
 
 # %% [markdown]
 # # Evaluation Loop
 
 # %%
-async def evaluate(
-    engine: PGEngine,
+async def evaluate_config(
+    engine: AsyncPGVecTextSearchEngine,
     embedding_service,
+    table_config: TableConfig,
+    config_name: str,
+    config: SearchConfig,
     qrels_dict: dict[str, set[str]],
     queries_dict: dict[str, str],
     k_values: list[int],
 ) -> dict[str, dict[str, float]]:
-    """Evaluate dense search across all queries."""
-    store = await PGVectorStore.create(
+    store = await PGVecTextSearchStore.create(
         engine=engine,
         embedding_service=embedding_service,
-        table_name=TABLE_NAME,
+        table_config=table_config,
+        search_config=config,
     )
 
     results_by_k = {k: defaultdict(list) for k in k_values}
     max_k = max(k_values)
-
     valid_query_ids = [qid for qid in qrels_dict.keys() if qid in queries_dict]
 
-    print(f"\nEvaluating pgvector dense ({len(valid_query_ids)} queries)...")
+    print(f"\nEvaluating {config_name} ({len(valid_query_ids)} queries)...")
 
-    for query_id in atqdm(valid_query_ids, desc="pgvector dense"):
+    for query_id in atqdm(valid_query_ids, desc=config_name):
         query_text = f"Query: {queries_dict[query_id]}"
         relevant_ids = qrels_dict[query_id]
-
         results = await store.asimilarity_search_with_score(query_text, k=max_k)
         retrieved_ids = [doc.metadata.get("corpus_id") for doc, _ in results]
 
@@ -198,7 +175,6 @@ async def evaluate(
             "MRR": np.mean(results_by_k[k]["mrr"]),
             "MAP": np.mean(results_by_k[k]["ap"]),
         }
-
     return aggregated
 
 
@@ -206,44 +182,78 @@ async def evaluate(
 # # Main Evaluation
 
 # %%
-async def main(k_values: list[int] = [5, 10, 20], split: str = "dev"):
-    """Run evaluation."""
-    engine = PGEngine.from_connection_string(DATABASE_URL)
+async def main(index_cfg: dict, eval_cfg: dict):
+    ds = index_cfg["dataset"]
+    emb = index_cfg.get("embedding", {})
 
-    print(f"=== Ko-StrategyQA pgvector Evaluation ===")
-    print(f"Table: {TABLE_NAME}")
-    print(f"Query language: {QUERY_LANG}")
-    print(f"EMBEDDING: {settings.embedding_model}")
+    table_name = ds["table_name"]
+    query_lang = ds.get("query_lang", "ko")
+    text_config = ds["text_config"]
+    k_values = eval_cfg.get("k_values", [5, 10, 20])
+    split = eval_cfg.get("split", "dev")
+
+    database_url = "postgresql+asyncpg://{}:{}@{}:{}/{}".format(
+        settings.postgres_user,
+        settings.postgres_password,
+        settings.postgres_ip,
+        settings.postgres_port,
+        settings.postgres_db,
+    )
+
+    engine = AsyncPGVecTextSearchEngine.from_connection_string(database_url)
+
+    embedding_dim = emb.get("dim", settings.embedding_dim)
+    table_config = TableConfig(
+        table_name=table_name,
+        vector_size=embedding_dim,
+    )
+
+    embedding_model = emb.get("model", settings.embedding_model)
+    embedding_base_url = emb.get("base_url", settings.embedding_base_url)
+    embedding_api_key = emb.get("api_key", settings.embedding_api_key)
+
+    print(f"=== markers_bm Evaluation (text_config: {text_config}) ===")
+    print(f"Table: {table_name}")
+    print(f"Query language: {query_lang}")
+    print(f"EMBEDDING: {embedding_model}")
 
     embedding_service = OpenAIEmbeddings(
-        model=settings.embedding_model,
-        base_url=settings.embedding_base_url,
-        api_key=settings.embedding_api_key,
-        dimensions=settings.embedding_dim,
-        check_embedding_ctx_length=False
+        model=embedding_model,
+        base_url=embedding_base_url,
+        api_key=embedding_api_key,
+        dimensions=embedding_dim,
+        check_embedding_ctx_length=False,
     )
 
     print(f"\nLoading evaluation data from {settings.data_dir} (split: {split})...")
     qrels_dict, queries_dict = load_evaluation_data(
-        settings.data_dir, split, query_lang=QUERY_LANG
+        settings.data_dir, split, query_lang=query_lang
     )
     print(f"Loaded {len(qrels_dict)} queries with relevance judgments")
 
-    results = await evaluate(
-        engine=engine,
-        embedding_service=embedding_service,
-        qrels_dict=qrels_dict,
-        queries_dict=queries_dict,
-        k_values=k_values,
-    )
+    configs = build_search_configs(index_cfg, eval_cfg)
 
-    return {"pgvector dense": results}
+    all_results = {}
+    for config_name, config in configs.items():
+        results = await evaluate_config(
+            engine=engine,
+            embedding_service=embedding_service,
+            table_config=table_config,
+            config_name=config_name,
+            config=config,
+            qrels_dict=qrels_dict,
+            queries_dict=queries_dict,
+            k_values=k_values,
+        )
+        all_results[config_name] = results
+
+    await engine.close()
+    return all_results, k_values
 
 
 def print_results(all_results: dict, k_values: list[int]):
-    """Print results in formatted tables."""
     print(f"\n{'='*70}")
-    print(f"Ko-StrategyQA pgvector EVALUATION RESULTS")
+    print(f"EVALUATION RESULTS")
     print(f"{'='*70}")
 
     for k in k_values:
@@ -253,12 +263,10 @@ def print_results(all_results: dict, k_values: list[int]):
             row = {"Config": config_name}
             row.update(results[k])
             rows.append(row)
-
         df = pd.DataFrame(rows)
         df = df.set_index("Config")
         print(df.to_string(float_format=lambda x: f"{x:.4f}"))
 
-    # Summary table
     print(f"\n{'='*70}")
     print("Summary Table")
     print(f"{'='*70}")
@@ -276,19 +284,21 @@ def print_results(all_results: dict, k_values: list[int]):
     summary_df = pd.DataFrame(summary_rows)
     summary_df = summary_df.set_index("Config")
     print(summary_df.to_string(float_format=lambda x: f"{x:.4f}"))
-
     return summary_df
 
 
 # %%
 if __name__ == "__main__":
-    K_VALUES = [5, 10, 20]
-    SPLIT = "dev"
+    args = parse_args()
+    index_cfg = load_experiment_config(args.index_config)
+    eval_cfg = load_experiment_config(args.eval_config)
 
-    results = asyncio.run(main(k_values=K_VALUES, split=SPLIT))
-    print_results(results, K_VALUES)
+    all_results, k_values = asyncio.run(main(index_cfg, eval_cfg))
+    print_results(all_results, k_values)
 
 # %%
 # For Jupyter notebook:
-# results = await main(k_values=[5, 10, 20], split="dev")
-# summary_df = print_results(results, [5, 10, 20])
+# index_cfg = load_experiment_config("configs/ko-qwen3.yaml")
+# eval_cfg = load_experiment_config("configs/evaluate.yaml")
+# all_results, k_values = await main(index_cfg, eval_cfg)
+# summary_df = print_results(all_results, k_values)

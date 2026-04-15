@@ -4,6 +4,7 @@ Metadata filter definitions for PGVecTextSearch.
 Follows LlamaIndex-style filter syntax for consistency.
 https://github.com/run-llama/llama_index/blob/main/llama-index-core/llama_index/core/vector_stores/types.py
 """
+
 from __future__ import annotations
 
 from enum import Enum
@@ -162,7 +163,13 @@ OPERATOR_TO_SQL = {
 }
 
 # Operators that need special handling
-ARRAY_OPERATORS = {FilterOperator.IN, FilterOperator.NIN, FilterOperator.ANY, FilterOperator.ALL, FilterOperator.CONTAINS}
+ARRAY_OPERATORS = {
+    FilterOperator.IN,
+    FilterOperator.NIN,
+    FilterOperator.ANY,
+    FilterOperator.ALL,
+    FilterOperator.CONTAINS,
+}
 EXISTENCE_OPERATORS = {FilterOperator.IS_EMPTY, FilterOperator.EXISTS}
 RANGE_OPERATORS = {FilterOperator.BETWEEN}
 
@@ -255,7 +262,7 @@ def _build_single_filter(
     # metadata_columns parameter is kept for backward compatibility but not used
     if json_column:
         # JSON ->> returns text, so we need type casting for numeric comparisons
-        json_path = f'"{json_column}"->>\'{f.key}\''
+        json_path = f"\"{json_column}\"->>'{f.key}'"
         # Determine if we need numeric casting based on value type
         if isinstance(f.value, (int, float)) and f.value is not None:
             field_selector = f"({json_path})::numeric"

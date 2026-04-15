@@ -3,6 +3,8 @@
 Korean retrieval evaluation using the markers_bm dataset.
 
 ## Perf
+### Qwen3-Embedding-0.6B
+**[korean]**
 ```
 --- Results @ k=5 ---
                           Recall@5  Precision@5  nDCG@5    MRR    MAP
